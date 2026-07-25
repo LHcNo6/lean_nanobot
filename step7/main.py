@@ -80,8 +80,7 @@ async def main() -> None:
 
         # Persist
         skip = 1 + len(history)
-        for m in result.messages[skip:]:
-            session.messages.append(m)
+        session.import_messages(result.messages[skip:])
         session_manager.save(session)
         print()
 

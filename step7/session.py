@@ -43,6 +43,15 @@ class Session:
         self.updated_at = datetime.now().isoformat()
         return msg
 
+    def import_messages(self, messages: list[dict[str, Any]]) -> None:
+        now = datetime.now().isoformat()
+        for msg in messages:
+            if "timestamp" not in msg:
+                msg = dict(msg)
+                msg["timestamp"] = now
+            self.messages.append(msg)
+        self.updated_at = now
+
     def get_history(
         self, max_messages: int = 50
     ) -> list[dict[str, Any]]:

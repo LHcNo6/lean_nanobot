@@ -65,6 +65,32 @@ class TestSession(unittest.TestCase):
         self.assertEqual(history[0]["content"], "3")
         self.assertEqual(history[1]["content"], "4")
 
+    def test_import_messages_adds_timestamp(self):
+        session = Session(key="test")
+        raw = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        session.import_messages(raw)
+        self.assertEqual(len(session.messages), 2)
+        for msg in session.messages:
+            self.assertIn("timestamp", msg)
+
+    def test_import_messages_preserves_existing_timestamp(self):
+        session = Session(key="test")
+        raw = [{"role": "user", "content": "hi", "timestamp": "2024-01-01T00:00:00"}]
+        session.import_messages(raw)
+        self.assertEqual(session.messages[0]["timestamp"], "2024-01-01T00:00:00")
+
+    def test_import_messages_updates_updated_at(self):
+        session = Session(key="test")
+        session.updated_at = "2000-01-01T00:00:00"
+        session.import_messages([{"role": "user", "content": "hi"}])
+        self.assertGreater(session.updated_at, "2000-01-01T00:00:00")
+
+    def test_import_messages_does_not_mutate_input(self):
+        session = Session(key="test")
+        raw = [{"role": "user", "content": "hi"}]
+        session.import_messages(raw)
+        self.assertNotIn("timestamp", raw[0])
+
 
 class TestSessionManager(unittest.TestCase):
     def test_get_or_create_new(self):
@@ -183,8 +209,7 @@ class TestIntegrationMultiTurn(unittest.IsolatedAsyncioTestCase):
             spec = AgentRunSpec(initial_messages=msgs, tools=registry, provider=provider)
             result = await AgentRunner().run(spec)
             skip = 1 + len(history)
-            for m in result.messages[skip:]:
-                session.messages.append(m)
+            session.import_messages(result.messages[skip:])
             sm.save(session)
             self.assertEqual(len(session.messages), 2)  # user + assistant
             self.assertEqual(session.messages[0]["content"], "Hello")
@@ -197,8 +222,7 @@ class TestIntegrationMultiTurn(unittest.IsolatedAsyncioTestCase):
             spec = AgentRunSpec(initial_messages=msgs, tools=registry, provider=provider)
             result = await AgentRunner().run(spec)
             skip = 1 + len(history)
-            for m in result.messages[skip:]:
-                session.messages.append(m)
+            session.import_messages(result.messages[skip:])
             sm.save(session)
             self.assertEqual(len(session.messages), 4)
             self.assertEqual(session.messages[2]["content"], "Again")
@@ -230,8 +254,7 @@ class TestIntegrationMultiTurn(unittest.IsolatedAsyncioTestCase):
             result = await AgentRunner().run(spec)
 
             skip = 1 + len(history)
-            for m in result.messages[skip:]:
-                session.messages.append(m)
+            session.import_messages(result.messages[skip:])
             sm.save(session)
 
             # user, assistant(tool_calls), tool result, assistant(final)
