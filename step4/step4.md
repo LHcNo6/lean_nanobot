@@ -44,11 +44,14 @@ r = ToolResult.error("失败")      # 工厂方法
 
 ```python
 class Tool(ABC):
-    @property @abstractmethod
+    @property 
+    @abstractmethod
     def name(self) -> str: ...
-    @property @abstractmethod
+    @property 
+    @abstractmethod
     def description(self) -> str: ...
-    @property @abstractmethod
+    @property 
+    @abstractmethod
     def parameters(self) -> dict: ...  # JSON Schema
     async def execute(self, **kwargs) -> ToolResult: ...
     def to_schema(self) -> dict: ...   # → OpenAI tool format
