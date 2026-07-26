@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from step8.session import Session
+from step10.session import Session
 
 
 def estimate_message_tokens(msg: dict[str, Any]) -> int:
@@ -50,7 +50,7 @@ class Consolidator:
         max_tokens: int,
         model: str | None = None,
     ) -> str | None:
-        unconsolidated = session.messages[session.last_consolidated: ]
+        unconsolidated = session.messages[session.last_consolidated:]
         if not unconsolidated:
             return None
 
