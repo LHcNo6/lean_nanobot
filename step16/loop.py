@@ -6,16 +6,20 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import Any
 
-from step15.bus import MessageBus
-from step15.consolidation import Consolidator
-from step15.context import ContextBuilder
-from step15.events import InboundMessage, OutboundMessage, StreamDeltaEvent
-from step15.hook import AgentHook, AgentHookContext, CompositeHook
-from step15.llm import LLMResponse, Runtime, ToolCallRequest
-from step15.memory import MemoryStore
-from step15.runner import AgentRunResult, AgentRunSpec, AgentRunner
-from step15.session import Session, SessionManager
-from step15.tool import ToolRegistry
+from step16.bus import MessageBus
+from step16.consolidation import Consolidator
+from step16.context import ContextBuilder
+from step16.events import InboundMessage, OutboundMessage, StreamDeltaEvent
+from step16.goal_state import goal_state_runtime_lines, sustained_goal_active
+from step16.hook import AgentHook, AgentHookContext, CompositeHook
+from step16.llm import LLMResponse, Runtime, ToolCallRequest
+from step16.memory import MemoryStore
+from step16.runner import AgentRunResult, AgentRunSpec, AgentRunner
+from step16.session import Session, SessionManager
+from step16.subagent import SubagentManager
+from step16.tool import ToolRegistry
+from step16.tools.long_task import CreateGoalTool, UpdateGoalTool
+from step16.tools.spawn import SpawnTool
 
 
 class TurnState(Enum):
@@ -84,6 +88,7 @@ class AgentLoop:
         memory: MemoryStore,
         identity: str,
         replay_budget: int,
+        subagent_manager: SubagentManager | None = None,
         hooks: list[AgentHook] | None = None,
     ) -> None:
         self.bus = bus
@@ -94,6 +99,7 @@ class AgentLoop:
         self.memory = memory
         self.identity = identity
         self.replay_budget = replay_budget
+        self.subagents = subagent_manager
         self.hooks = list(hooks) if hooks else []
         self.running = False
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -111,6 +117,14 @@ class AgentLoop:
             build_messages=context_builder.build_messages,
             get_tool_definitions=registry.get_definitions,
             provider=provider,
+        )
+        self._create_goal_tool = CreateGoalTool(sessions=session_manager)
+        self._update_goal_tool = UpdateGoalTool(sessions=session_manager)
+        self._spawn_tool = SpawnTool(manager=subagent_manager)
+        self._goal_continue_message = (
+            "You have an active sustained goal. "
+            "Continue working toward the objective using your tools, "
+            "or call update_goal with action='complete' if the work is done."
         )
 
     def _schedule_background(self, coro: Any) -> None:
@@ -131,7 +145,7 @@ class AgentLoop:
         return self._pending_queues[session_key]
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        session_key = msg.session_key or msg.chat_id
+        session_key = msg.session_key_override or msg.session_key or msg.chat_id
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         if lock.locked():
             await self._get_or_create_queue(session_key).put(msg)
@@ -187,24 +201,36 @@ class AgentLoop:
 
     async def _state_build(self, ctx: TurnContext) -> str:
         ctx.history = ctx.session.get_history(max_messages=50, max_tokens=self.replay_budget)
+        goal_lines = goal_state_runtime_lines(ctx.session.metadata)
+        identity = self.identity
+        if goal_lines:
+            identity = identity + "\n\n" + "\n".join(goal_lines)
         ctx.initial_messages = self.context.build_messages(
             current_message=ctx.msg.content,
             history=ctx.history,
-            identity=self.identity,
+            identity=identity,
             session_summary=ctx.summary,
         )
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
+        session_key = ctx.session_key
+        self._create_goal_tool.set_session_key(session_key)
+        self._update_goal_tool.set_session_key(session_key)
+
+        self.registry.register(self._spawn_tool)
+        self.registry.register(self._create_goal_tool)
+        self.registry.register(self._update_goal_tool)
+
         hooks = list(self.hooks)
         hooks.append(StreamPublishingHook(
             bus=self.bus, chat_id=ctx.msg.chat_id,
-            channel=ctx.msg.channel, session_key=ctx.session_key,
+            channel=ctx.msg.channel, session_key=session_key,
         ))
         hook = CompositeHook(hooks) if len(hooks) > 1 else hooks[0]
 
         async def injection_callback():
-            queue = self._pending_queues.get(ctx.session_key)
+            queue = self._pending_queues.get(session_key)
             if queue is None or queue.empty():
                 return []
             msgs = []
@@ -222,8 +248,10 @@ class AgentLoop:
             provider=self.provider,
             max_iterations=5,
             hook=hook,
-            session_key=ctx.session_key,
+            session_key=session_key,
             injection_callback=injection_callback,
+            goal_active_predicate=lambda: sustained_goal_active(ctx.session.metadata) if ctx.session else False,
+            goal_continue_message=self._goal_continue_message,
         )
         ctx.result = await self._runner.run(spec)
         return "ok"

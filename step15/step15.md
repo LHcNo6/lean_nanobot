@@ -114,4 +114,4 @@ Dream 循环（main.py 后台，每 _DREAM_INTERVAL_SECONDS 触发）：
 
 ## 下一站
 
-Step 16 — Channel Integration + Plugin System
+Step 16 — Subagents + Sustained Goals

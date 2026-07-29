@@ -1,12 +1,12 @@
-## Step 13 — Data Flow Documentation
+## Step 14 — Data Flow Documentation
 
-**New in Step 13 vs Step 12:** Mid-turn injection. While the runner is processing a turn, if additional messages arrive for the same session (from the user while the LLM is still responding), they are queued and injected into the ongoing conversation rather than blocked.
+**New in Step 14 vs Step 13:** Context governance system. `ContextGovernor` sanitizes and budgets messages before each LLM iteration, handling placeholder stripping, malformed tool calls, orphan tool results, tool result backfill, tool result truncation, inflight compaction, and history snipping.
 
 ---
 
 ## `llm.py`
 
-### Dataclasses (no logic, pure data)
+### Dataclasses (pure data, no logic)
 - `ToolCallRequest`: id, name, arguments
 - `LLMResponse`: content, tool_calls, finish_reason, usage
 - `RetryConfig`: max_retries, base_delay, max_delay, retry_mode
@@ -15,7 +15,7 @@
 
 ## `events.py`
 
-### Dataclasses (no logic, pure data)
+### Dataclasses (pure data, no logic)
 - `InboundMessage`: content, channel, sender_id, chat_id, timestamp, session_key, metadata
 - `OutboundMessage`: content, channel, chat_id, metadata
 - `StreamDeltaEvent(OutboundMessage)`: content, channel, chat_id, metadata, finished, session_key
@@ -38,6 +38,82 @@
 
 ---
 
+## `helpers.py`
+
+### Functions
+- `truncate_text(text, max_chars)`: truncates string with suffix, returns original if within limit
+  - Called by: ContextGovernor.normalize_tool_result
+- `stringify_text_blocks(content)`: extracts text from content block list, returns joined string or None
+- `ensure_nonempty_tool_result(tool_name, content)`: replaces None/empty results with placeholder message
+  - Called by: ContextGovernor.normalize_tool_result
+- `find_legal_message_start(messages)`: finds first index where tool results have matching tool call declarations
+  - Called by: ContextGovernor._legal_history_tail
+- `estimate_message_tokens(message)`: estimates token count for a single message dict
+  - Called by: estimate_prompt_tokens, ContextGovernor.snip_history
+- `estimate_prompt_tokens(messages, tools)`: sums message tokens + tool tokens + overhead
+  - Called by: estimate_prompt_tokens_chain
+- `estimate_prompt_tokens_chain(provider, model, messages, tools)`: tries provider's counter first, falls back to char estimate
+  - Called by: ContextGovernor.compact_inflight_overflow, ContextGovernor.snip_history
+
+---
+
+## `governance.py`
+
+### Constants
+- `SNIP_SAFETY_BUFFER`, `MICROCOMPACT_KEEP_RECENT`, `MICROCOMPACT_MIN_CHARS`, `INFLIGHT_COMPACT_TARGET_RATIO`
+- `COMPACTABLE_TOOLS`: tools whose results can be compacted mid-flight
+- `TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS`: tools exempt from truncation
+- `BACKFILL_CONTENT`: placeholder for missing tool results
+- `PLACEHOLDER_TEXTS`: assistant messages to strip
+
+### `_tool_call_name_is_valid(tool_call)` (function)
+- Validates that tool call dict has a non-empty function name
+- Called by: ContextGovernor.strip_malformed_tool_calls
+
+### `@dataclass ContextGovernanceConfig`
+- Fields: tools, context_window_tokens, context_block_limit, max_tokens, max_tool_result_chars, workspace, session_key, inflight_start_index
+
+### `class ContextGovernor`
+- `prepare_for_model(config, messages, compacted_tool_call_ids)`:
+  - Input: config, message list, set of already-compacted tool call IDs
+  - Process: chain of cleaning steps → returns sanitized messages
+  - Output: cleaned message list
+  - Called by: AgentRunner._run_loop
+  - Calls: strip_placeholder_assistant_messages, strip_malformed_tool_calls, drop_orphan_tool_results, backfill_missing_tool_results, apply_tool_result_budget, compact_inflight_overflow, snip_history (loops drop_orphan + backfill twice)
+- `input_budget(config)` (static):
+  - Returns usable token budget from context window minus max_tokens and safety buffer
+- `normalize_tool_result(config, tool_call_id, tool_name, result)` (static):
+  - Ensures non-empty, truncates if over budget and not exempt
+- `strip_placeholder_assistant_messages(messages)` (static):
+  - Removes assistant messages with placeholder content (no tool_calls)
+- `strip_malformed_tool_calls(messages)` (static):
+  - Removes tool calls with invalid names, drops empty tool_call arrays
+- `drop_orphan_tool_results(messages)` (static):
+  - Removes tool messages whose tool_call_id has no matching assistant declaration
+- `backfill_missing_tool_results(messages)` (static):
+  - Inserts placeholder tool messages for declared tool calls missing results
+- `apply_tool_result_budget(config, messages)`:
+  - Applies normalize_tool_result to each tool message
+- `compact_inflight_overflow(config, messages, compacted_tool_call_ids)`:
+  - If over budget, compacts COMPACTABLE_TOOLS results by replacing with summary text
+  - Calls: estimate_prompt_tokens_chain, _apply_recorded_compactions, _inflight_compaction_candidates, _summary_for
+- `snip_history(config, messages)`:
+  - If over budget, drops oldest non-system messages preserving legal tails
+  - Calls: estimate_prompt_tokens_chain, estimate_message_tokens, _legal_history_tail
+- `_summary_for(message)` (static):
+  - Returns compaction placeholder string
+- `_legal_history_tail(kept, non_system)` (static):
+  - Ensures history ends at a valid boundary (after user message)
+  - Calls: _user_tail, find_legal_message_start
+- `_user_tail(messages, last)` (static):
+  - Returns suffix starting from last user message
+- `_apply_recorded_compactions(messages, compacted_tool_call_ids)` (static):
+  - Applies already-recorded compactions to messages
+- `_inflight_compaction_candidates(config, messages, compacted_tool_call_ids)`:
+  - Returns list of (index, tool_call_id) candidates for compaction, sorted by age
+
+---
+
 ## `hook.py`
 
 ### Dataclasses
@@ -45,98 +121,56 @@
 - `AgentRunHookContext`: messages, final_content, tools_used, usage, stop_reason, error, exception
 
 ### `class AgentHook` (abstract base)
-- `before_run(ctx)`: called before AgentRunner.run()
-- `after_run(ctx)`: called after successful run
-- `on_error(ctx)`: called on exception
-- `on_finally(ctx)`: always called in finally block
-- `before_iteration(ctx)`: called before each LLM iteration
-- `after_iteration(ctx)`: called after each LLM iteration
-- `on_stream(ctx, delta)`: called on each stream chunk
-- `on_stream_end(ctx)`: called when stream finishes
+- `before_run(ctx)`, `after_run(ctx)`, `on_error(ctx)`, `on_finally(ctx)`, `before_iteration(ctx)`, `after_iteration(ctx)`, `on_stream(ctx, delta)`, `on_stream_end(ctx)`
 
 ### `class CompositeHook(AgentHook)`
-- `__init__(hooks)`: stores list of AgentHook
-- `_for_each(method, context)`: iterates hooks, catches exceptions
-- Delegates all hook methods to `_for_each`
-- `on_stream` / `on_stream_end`: specialized iteration with try/catch per hook
-  - Called by: AgentRunner._run_loop → spec.provider.chat_stream_with_retry (on_delta)
+- Delegates all hook methods to list of hooks with error isolation
 
 ---
 
 ## `context.py`
 
 ### `class ContextBuilder`
-- `__init__(workspace, bootstrap_files)`: config
-- `build_system_prompt(identity, session_summary)`:
-  - Input: identity string or default, optional session_summary
-  - Process: reads bootstrap files (AGENTS.md, SOUL.md, USER.md) from workspace if they exist
-  - Output: combined system prompt string
+- `build_system_prompt(identity, session_summary)`: reads bootstrap files, builds system prompt
   - Called by: build_messages
-- `build_messages(current_message, history, identity, session_summary)`:
-  - Input: current user message, optional history, identity, session_summary
-  - Process: builds system prompt + history + current user message
-  - Output: list of message dicts
+- `build_messages(current_message, history, identity, session_summary)`: assembles system + history + user message
   - Called by: loop.py → AgentLoop._state_build
 
 ---
 
 ## `consolidation.py`
 
-### `estimate_message_tokens(msg)` (function)
-- Input: single message dict
-- Process: estimates token count by string length heuristic
-- Output: int token count
-- Called by: estimate_prompt_tokens, Consolidator._find_boundary, Session.get_history
-
-### `estimate_prompt_tokens(messages)` (function)
-- Input: list of message dicts
-- Output: int total estimated tokens
-- Called by: Consolidator.maybe_consolidate
+### Functions
+- `estimate_message_tokens(msg)`: token estimate via string length heuristic
+  - Called by: estimate_prompt_tokens, Consolidator._find_boundary, Session.get_history
+- `estimate_prompt_tokens(messages)`: sums message tokens + overhead
+  - Called by: Consolidator.maybe_consolidate
 
 ### `class Consolidator`
-- `__init__(provider, consolidation_ratio)`: stores LLM provider and ratio
-- `maybe_consolidate(session, max_tokens, model)`:
-  - Input: Session object, max_tokens budget, optional model
-  - Process: if unconsolidated messages exceed target, finds boundary, optionally archives via LLM, updates session.last_consolidated
-  - Output: summary string or None
+- `maybe_consolidate(session, max_tokens, model)`: if unconsolidated exceeds budget, archives/summarizes old messages
   - Called by: loop.py → AgentLoop._state_compact
   - Calls: estimate_prompt_tokens, _find_boundary, _archive
-- `_find_boundary(unconsolidated, target_tokens)` (static):
-  - Input: messages list, target token budget
-  - Process: finds cut point preserving most recent messages up to budget
-  - Output: boundary index
-- `_archive(messages, model)`:
-  - Input: messages to archive, optional model
-  - Process: calls provider.chat_with_retry to summarize
-  - Output: summary string or None on failure
+- `_find_boundary(unconsolidated, target_tokens)` (static): finds cut point
+- `_archive(messages, model)`: calls provider.chat_with_retry to summarize
   - Calls: _format_messages
-- `_format_messages(messages)` (static):
-  - Input: messages list
-  - Output: formatted string for summarization prompt
+- `_format_messages(messages)` (static): formats messages for summarization prompt
 
 ---
 
 ## `tool.py`
 
 ### `class ToolResult(str)`
-- `__new__(content, is_error)`: creates string subclass with is_error flag
 - `error(content)`: classmethod returning ToolResult with is_error=True
 
 ### `class Tool(ABC)`
-- `name` / `description` / `parameters`: abstract properties
-- `execute(**kwargs)`: async, raises NotImplementedError
 - `to_schema()`: returns OpenAI-compatible tool schema dict
   - Called by: ToolRegistry.get_definitions
 
 ### `class ToolRegistry`
-- `__init__()`: creates dict for tool lookup
-- `register(tool)`: stores tool by name
-- `unregister(name)`: removes tool
-- `get(name)`: returns Tool or None
-- `has(name)`: bool check
+- `register(tool)`, `unregister(name)`, `get(name)`, `has(name)`
 - `get_definitions()`: returns list of tool schemas
-  - Called by: AgentRunner._run_loop, runner tests
-- `execute(name, **params)`: async, executes tool by name, catches errors
+  - Called by: AgentRunner._run_loop, ContextGovernor.snip_history/compact_inflight_overflow
+- `execute(name, **params)`: async, executes tool by name
   - Called by: AgentRunner._run_loop
 
 ---
@@ -144,87 +178,47 @@
 ## `tools/echo.py`
 
 ### `class EchoTool(Tool)`
-- `name`: "echo"
-- `description`: "Echoes back the input text."
-- `parameters`: schema with "text" string property
-- `execute(**kwargs)`: returns ToolResult("Echo: {text}")
-  - Called by: ToolRegistry.execute
+- `name`: "echo", `execute(**kwargs)`: returns `ToolResult("Echo: {text}")`
 
 ---
 
 ## `session.py`
 
-### `safe_filename(name)` (function)
-- Input: string
-- Process: replaces unsafe filesystem characters
-- Output: safe string
-
-### `ensure_dir(path)` (function)
-- Creates directory if not exists
-- Returns Path
+### Functions
+- `safe_filename(name)`: replaces unsafe filesystem characters
+- `ensure_dir(path)`: creates directory if not exists
 
 ### `class Session`
-- `__init__(key, ...)`: stores key, messages list, timestamps, metadata, last_consolidated index
-- `add_message(role, content, **kwargs)`:
-  - Input: role, content, extra fields
-  - Process: creates message dict with timestamp, appends
-  - Output: the message dict
-- `import_messages(messages)`:
-  - Input: list of message dicts
-  - Process: adds timestamp if missing, appends all
+- `add_message(role, content, **kwargs)`: appends message with timestamp
+- `import_messages(messages)`: appends messages with timestamp fallback
   - Called by: loop.py → AgentLoop._state_save
-- `get_history(max_messages, max_tokens)`:
-  - Input: limits
-  - Process: slices from last_consolidated, optionally trims by token count or message count
-  - Output: list of message dicts
+- `get_history(max_messages, max_tokens)`: returns unconsolidated messages, trimmed by token/message count
   - Called by: loop.py → AgentLoop._state_build
 
 ### `class SessionManager`
-- `__init__(workspace)`: sets sessions directory, inits cache
-- `_session_path(key)`: returns Path to JSONL file
-- `get_or_create(key)`:
-  - Input: session key
-  - Process: checks cache → tries _load → creates new Session
-  - Output: Session
+- `get_or_create(key)`: returns cached or loaded or new Session
   - Called by: loop.py → AgentLoop._state_restore, main.py → main()
-- `_load(key)`:
-  - Input: session key
-  - Process: reads JSONL file, reconstructs Session
-  - Output: Session or None
-- `save(session, fsync)`:
-  - Input: Session, optional fsync flag
-  - Process: writes metadata + messages as JSONL to temp file → atomic replace
+- `_load(key)`: reads JSONL file → reconstructs Session
+- `save(session, fsync)`: writes metadata + messages as JSONL via atomic replace
   - Called by: loop.py → AgentLoop._state_save
 
 ---
 
 ## `provider.py`
 
-### `_is_retryable_exception(exc)` (function)
-- Determines if an exception is retryable (timeout, connection, rate limit, 5xx)
-
-### `_backoff_delay(attempt, config)` (function)
-- Calculates exponential backoff with jitter
+### Functions
+- `_is_retryable_exception(exc)`: determines if exception is retryable
+- `_backoff_delay(attempt, config)`: exponential backoff with jitter
 
 ### `class _StreamGuard`
 - Simple flag: delta_delivered
 
 ### `class LLMProvider(ABC)`
-- `chat(messages, tools, model, temperature, max_tokens)` (abstract):
-  - Input: message list, tool schemas, model params
-  - Output: LLMResponse
-- `chat_stream(messages, ...)`:
-  - Default implementation: calls chat(), then calls on_content_delta with full content
-  - Output: LLMResponse
-- `chat_with_retry(messages, ...)`:
-  - Input: same as chat + optional RetryConfig
-  - Process: calls chat in loop with exponential backoff on retryable errors
-  - Output: LLMResponse
+- `chat(messages, ...)`: abstract
+- `chat_stream(messages, ...)`: default calls chat(), then on_content_delta
+- `chat_with_retry(messages, ...)`: retry loop with exponential backoff
   - Called by: Consolidator._archive
-- `chat_stream_with_retry(messages, ...)`:
-  - Input: same as chat_stream + optional RetryConfig
-  - Process: calls chat_stream in loop, but only retries if no delta delivered
-  - Output: LLMResponse
+- `chat_stream_with_retry(messages, ...)`: streaming retry, only retries if no delta delivered
   - Called by: AgentRunner._run_loop
 
 ---
@@ -232,31 +226,16 @@
 ## `openai_compat_provider.py`
 
 ### `class OpenAICompatProvider(LLMProvider)`
-- `__init__(api_key, api_base, model)`: creates AsyncOpenAI client
-- `model`: returns default model name
-- `chat(messages, tools, model, temperature, max_tokens)`:
-  - Process: builds kwargs → calls OpenAI API → parses response
-  - Output: LLMResponse
+- `chat(messages, ...)`: calls OpenAI API → _parse_response
   - Calls: _build_kwargs, _parse_response
-- `chat_stream(messages, tools, model, temperature, max_tokens, on_content_delta)`:
-  - Process: builds kwargs with stream=True → iterates chunks → calls on_content_delta per chunk
-  - Output: LLMResponse assembled from chunks
+- `chat_stream(messages, ...)`: streaming, calls on_content_delta per chunk
   - Calls: _build_kwargs, _assemble_from_chunks
-- `_build_kwargs(...)`: returns dict for OpenAI API call
-- `_parse_response(resp)`:
-  - Input: OpenAI API response
-  - Output: LLMResponse
+- `_build_kwargs(...)`: builds API kwargs dict
+- `_parse_response(resp)`: parses API response → LLMResponse
   - Calls: _parse_tool_calls
-- `_assemble_from_chunks(chunks)`:
-  - Input: list of stream chunks
-  - Process: concatenates content, assembles tool calls, extracts usage
-  - Output: LLMResponse
-- `_parse_tool_calls(tool_calls_raw)` (static):
-  - Input: raw tool calls from API
-  - Output: list of ToolCallRequest
-- `from_env()` (classmethod):
-  - Reads OPENAI_API_KEY, OPENAI_API_BASE, OPENAI_MODEL from env
-  - Returns OpenAICompatProvider instance
+- `_assemble_from_chunks(chunks)`: concatenates stream chunks → LLMResponse
+- `_parse_tool_calls(tool_calls_raw)` (static): raw → list[ToolCallRequest]
+- `from_env()` (classmethod): reads env vars → OpenAICompatProvider
   - Called by: main.py → main()
 
 ---
@@ -264,88 +243,59 @@
 ## `runner.py`
 
 ### Dataclasses
-- `AgentRunSpec`: initial_messages, tools, provider, max_iterations, model, temperature, max_tokens, hook, session_key, **injection_callback** (NEW)
+- `AgentRunSpec`: initial_messages, tools, provider, max_iterations, model, temperature, max_tokens, hook, session_key, injection_callback, **governance_config (NEW)**
 - `AgentRunResult`: final_content, messages, tools_used, usage, stop_reason; total_prompt_tokens / total_completion_tokens properties
 
 ### `class AgentRunner`
 - `run(spec)`:
   - Input: AgentRunSpec
-  - Process: calls hook.before_run → _run_loop → hook.after_run/on_error → hook.on_finally
+  - Process: hook.before_run → _run_loop → hook.after_run/on_error → hook.on_finally
   - Output: AgentRunResult
   - Called by: loop.py → AgentLoop._state_run
   - Calls: hook methods, _run_loop
-- `_run_loop(spec, messages, tools_used, total_usage, hook)` — **modified with injection**:
+- `_run_loop(spec, messages, tools_used, total_usage, hook)`:
   - Process: for each iteration:
-    1. hook.before_iteration
-    2. calls provider.chat_stream_with_retry (streaming with on_delta callback)
-    3. hook.on_stream_end
-    4. **if tool_calls**:
-       - builds assistant msg, executes tools, appends tool results
-       - hook.after_iteration
-       - **NEW: calls spec.injection_callback() → appends injected messages**
-       - continues loop
-    5. **if text response**:
-       - appends assistant msg, hook.after_iteration
-       - **NEW: calls spec.injection_callback() → if messages returned, appends them and continues loop** (extends turn)
-       - otherwise returns AgentRunResult
+    1. **NEW: calls `ContextGovernor.prepare_for_model()` if governance_config set** — sanitizes messages
+    2. hook.before_iteration
+    3. calls provider.chat_stream_with_retry (streaming)
+    4. hook.on_stream_end
+    5. if tool_calls: execute tools, check injection → continue
+    6. if text: check injection (extends turn if messages), else return result
   - Called by: run()
-  - Calls: hook methods, provider.chat_stream_with_retry, spec.tools.execute, spec.injection_callback (NEW), _build_assistant_message, _accumulate_usage
-- `_build_assistant_message(response)` (static):
-  - Input: LLMResponse
-  - Output: assistant message dict with tool_calls
-- `_accumulate_usage(total, response)` (static):
-  - Input: running total dict, LLMResponse
-  - Process: accumulates prompt_tokens and completion_tokens
+  - Calls: ContextGovernor.prepare_for_model (NEW), hook methods, provider.chat_stream_with_retry, spec.tools.execute, spec.injection_callback, _build_assistant_message, _accumulate_usage
+- `_build_assistant_message(response)` (static): LLMResponse → assistant message dict
+- `_accumulate_usage(total, response)` (static): accumulates token usage
 
 ---
 
 ## `loop.py`
 
-### `enum TurnState`
-- RESTORE → COMPACT → BUILD → RUN → SAVE → RESPOND → DONE
+### `enum TurnState`: RESTORE → COMPACT → BUILD → RUN → SAVE → RESPOND → DONE
 
 ### `class TurnContext`
 - Holds: msg, session_key, state, session, summary, history, initial_messages, result, outbound
 
 ### `class StreamPublishingHook(AgentHook)`
-- `__init__(bus, chat_id, channel, session_key)`: stores bus reference
-- `on_stream(ctx, delta)`:
-  - If delta non-empty, publishes StreamDeltaEvent (finished=False) to bus.outbound
-- `on_stream_end(ctx)`:
-  - Publishes StreamDeltaEvent (finished=True) to bus.outbound
+- `on_stream(ctx, delta)`: publishes StreamDeltaEvent (finished=False)
+- `on_stream_end(ctx)`: publishes StreamDeltaEvent (finished=True)
 
 ### `class AgentLoop`
-- `__init__(...)`: stores all dependencies, init locks, init **pending queues** (NEW), creates AgentRunner
-- `run()`:
-  - Process: loop consuming bus.inbound → creates task for _dispatch(msg)
-  - Called by: main.py → main()
+- `__init__(...)`: stores all dependencies, init locks, pending queues, creates AgentRunner
+- `run()`: loop consuming bus.inbound → creates task for _dispatch(msg)
 - `stop()`: sets running = False
-- `_get_or_create_queue(session_key)` (NEW):
-  - Returns a per-session asyncio.Queue (maxsize=20), creating if needed
-  - Called by: _dispatch, _state_run
-- `_dispatch(msg)` — **modified**:
-  - Input: InboundMessage
-  - Process: gets per-session lock
-    - **If lock is already held (session busy): queues the message in _pending_queues[session_key]**
-    - If lock free: processes message → publishes outbound → **calls _drain_leftover** (NEW)
-  - Calls: _process_message, bus.publish_outbound, _get_or_create_queue, _drain_leftover
-- `_drain_leftover(session_key)` (NEW):
-  - Input: session_key
-  - Process: checks pending queue; if non-empty, republishes message to bus.inbound (to be picked up by the main loop)
-  - Called by: _dispatch (after session lock released)
-- `_process_message(msg, session_key)`:
-  - Same state machine as step12
-  - Calls: _state_restore, _state_compact, _state_build, _state_run, _state_save, _state_respond
-- `_state_restore(ctx)`: gets/creates Session → "ok"
-- `_state_compact(ctx)`: runs Consolidator → "ok"
-- `_state_build(ctx)`: gets history + builds messages → "ok"
-- `_state_run(ctx)` — **modified**:
+- `_get_or_create_queue(session_key)`: returns per-session asyncio.Queue (maxsize=20)
+- `_dispatch(msg)`: per-session lock → if busy, queue; else process → publish → _drain_leftover
+- `_drain_leftover(session_key)`: republishes queued messages back to bus.inbound
+- `_process_message(msg, session_key)`: state machine calling _state_* handlers
+- `_state_restore(ctx)`: SessionManager.get_or_create → "ok"
+- `_state_compact(ctx)`: Consolidator.maybe_consolidate → "ok"
+- `_state_build(ctx)`: get_history + build_messages → "ok"
+- `_state_run(ctx)`:
   - Creates StreamPublishingHook + CompositeHook
-  - **NEW: creates injection_callback closure** that drains `_pending_queues[ctx.session_key]`
-  - Creates AgentRunSpec with injection_callback → calls AgentRunner.run
-  - Output: "ok"
-  - Calls: AgentRunner.run
-- `_state_save(ctx)`: imports messages, saves session → "ok"
+  - Creates injection_callback draining _pending_queues[ctx.session_key]
+  - Creates AgentRunSpec with injection_callback → AgentRunner.run
+  - Called by: AgentRunner.run
+- `_state_save(ctx)`: import_messages + save → "ok"
 - `_state_respond(ctx)`: creates OutboundMessage → "ok"
 
 ---
@@ -353,7 +303,7 @@
 ## `main.py`
 
 ### `ainput(prompt)` (function)
-- Async wrapper around input() using executor
+- Async wrapper around input()
 
 ### `main()` (function)
 - Input: command-line arg for session_key (default: "default")
@@ -365,11 +315,10 @@
   5. CLI loop: reads user input, handles /exit, /history, /new commands
   6. Publishes InboundMessage → consumes OutboundMessage → prints response
 - Output: prints responses to console
-- Calls: MessageBus, AgentLoop, SessionManager, OpenAICompatProvider, Consolidator, ContextBuilder, ToolRegistry, EchoTool
 
 ---
 
-## End-to-End Data Flow (with Mid-Turn Injection)
+## End-to-End Data Flow (with Context Governance)
 
 ```
 User Input (CLI)
@@ -382,55 +331,48 @@ AgentLoop.run()
   │  consumes bus.inbound → _dispatch(msg)
   ▼
 AgentLoop._dispatch(msg)
-  │  gets per-session lock
+  │  per-session lock
+  │  [if free] → _process_message() [state machine]
   │
-  ├─ [if lock is FREE]:
-  │     ▼
-  │   _process_message()  [state machine]
-  │     ├─ _state_restore  → SessionManager.get_or_create() → Session
-  │     ├─ _state_compact  → Consolidator.maybe_consolidate() → summary
-  │     ├─ _state_build    → ContextBuilder.build_messages() → initial_messages
-  │     ├─ _state_run      → AgentRunner.run(AgentRunSpec)
-  │     │                      │
-  │     │                      │  AgentRunner._run_loop()
-  │     │                      │    ├─ LLM call → LLMResponse
-  │     │                      │    ├─ [if tool_calls]:
-  │     │                      │    │    execute tools
-  │     │                      │    │    └─ injection_callback() — drains pending msgs ← NEW
-  │     │                      │    │       from _pending_queues[session_key]
-  │     │                      │    │    └─ appends injected user messages → continue loop
-  │     │                      │    ├─ [if text response]:
-  │     │                      │    │    injection_callback() — drains pending msgs ← NEW
-  │     │                      │    │    ├─ [if injected msgs]: append, continue loop (extends turn)
-  │     │                      │    │    └─ [if empty]: return AgentRunResult
-  │     │                      │    └─ returns AgentRunResult
-  │     │                      ↓
-  │     ├─ _state_save     → Session.import_messages() + SessionManager.save()
-  │     └─ _state_respond  → OutboundMessage
-  │     ▼
-  │   publish OutboundMessage → bus.outbound
+  ├─ _state_restore  → SessionManager.get_or_create() → Session
+  ├─ _state_compact  → Consolidator.maybe_consolidate() → summary
+  ├─ _state_build    → ContextBuilder.build_messages() → initial_messages
+  ├─ _state_run      → AgentRunner.run(AgentRunSpec)
+  │                      │
+  │                      ▼
+  │                    AgentRunner._run_loop()
+  │                      │
+  │                      │  ContextGovernor.prepare_for_model() ← NEW
+  │                      │    ├─ strip_placeholder_assistant_messages
+  │                      │    ├─ strip_malformed_tool_calls
+  │                      │    ├─ drop_orphan_tool_results
+  │                      │    ├─ backfill_missing_tool_results
+  │                      │    ├─ apply_tool_result_budget
+  │                      │    ├─ compact_inflight_overflow
+  │                      │    ├─ snip_history
+  │                      │    └─ drop_orphan + backfill (repeat)
+  │                      │
+  │                      │  LLM call → LLMResponse
+  │                      │  [if tool_calls]: execute tools → injection → continue
+  │                      │  [if text]: injection check → return or extend turn
+  │                      │
+  │                      ▼
+  │                    AgentRunResult
   │
-  │  └─ _drain_leftover(session_key) ← NEW
-  │       checks pending queue
-  │       [if non-empty]: republishes to bus.inbound
-  │       (these will be consumed on next loop iteration)
+  ├─ _state_save     → Session.import_messages() + SessionManager.save()
+  └─ _state_respond  → OutboundMessage → bus.outbound
   │
-  └─ [if lock is BUSY]:
-        queued in _pending_queues[session_key] ← NEW
-        (will be injected mid-turn or drained after lock release)
-
-Output Flow:
-  main.py → consumes bus.outbound → prints response to console
+  ▼
+main.py → consumes bus.outbound → prints response
 ```
 
-### Key Differences from Step 12 (Mid-Turn Injection)
+### Key Differences from Step 13 (Context Governance)
 
-| Aspect | Step 12 | Step 13 |
+| Aspect | Step 13 | Step 14 |
 |--------|---------|---------|
-| Concurrent messages | Blocked by per-session lock | Queued in `_pending_queues` |
-| Runner._run_loop | No injection | Calls `injection_callback` after tool execution and before final response |
-| Turn extension | One response per turn | Injected messages can extend the turn (continue loop) |
-| AgentRunSpec | No injection_callback | Has `injection_callback: Callable[[], Awaitable[list[dict]]]` |
-| AgentLoop._dispatch | Simple lock → process | Lock → if busy, queue; after process, `_drain_leftover` |
-| AgentLoop | No pending queues | `_pending_queues: dict[str, asyncio.Queue]`, `_get_or_create_queue()`, `_drain_leftover()` |
-| _state_run | No injection | Creates injection_callback closure tied to session's pending queue |
+| Message preprocessing | None | `ContextGovernor.prepare_for_model()` before each iteration |
+| Tool result cleanup | None | Strips malformed, drops orphans, backfills missing |
+| Token budget management | Only via Consolidator (between turns) | Plus inflight compaction + history snipping (per iteration) |
+| AgentRunSpec | No governance_config | Has `governance_config: ContextGovernanceConfig` |
+| New files | — | `governance.py`, `helpers.py` |
+| Runner._run_loop | Simple loop | Calls `_GOVERNOR.prepare_for_model(spec.governance_config, ...)` each iteration |

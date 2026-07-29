@@ -3,16 +3,20 @@
 import asyncio
 import sys
 
-from step15.bus import MessageBus
-from step15.consolidation import Consolidator
-from step15.context import ContextBuilder
-from step15.events import InboundMessage, OutboundMessage
-from step15.loop import AgentLoop
-from step15.memory import MemoryStore
-from step15.openai_compat_provider import OpenAICompatProvider
-from step15.session import SessionManager
-from step15.tool import ToolRegistry
-from step15.tools.echo import EchoTool
+from step16.bus import MessageBus
+from step16.consolidation import Consolidator
+from step16.context import ContextBuilder
+from step16.events import InboundMessage, OutboundMessage
+from step16.goal_state import goal_state_runtime_lines, sustained_goal_active
+from step16.loop import AgentLoop
+from step16.memory import MemoryStore
+from step16.openai_compat_provider import OpenAICompatProvider
+from step16.session import SessionManager
+from step16.subagent import SubagentManager
+from step16.tool import ToolRegistry
+from step16.tools.echo import EchoTool
+from step16.tools.spawn import SpawnTool
+from step16.tools.long_task import CreateGoalTool, UpdateGoalTool
 
 _DEMO_CONTEXT_WINDOW = 1024
 _SAFETY_BUFFER = 128
@@ -35,18 +39,32 @@ async def _dream_loop(agent_loop: AgentLoop):
 
 async def main():
     session_key = sys.argv[1] if len(sys.argv) > 1 else "default"
-    identity = "You are lean_nanobot, a minimal AI agent learning consolidation."
+    identity = "You are lean_nanobot, a minimal AI agent with subagent and sustained goal support."
 
     registry = ToolRegistry()
     registry.register(EchoTool())
 
     provider = OpenAICompatProvider.from_env()
+    bus = MessageBus()
     memory = MemoryStore(workspace=".")
     session_manager = SessionManager(workspace=".")
     context_builder = ContextBuilder(workspace=".")
 
+    subagent_manager = SubagentManager(
+        bus=bus,
+        provider=provider,
+        tools=registry,
+        max_concurrent_subagents=5,
+    )
+
+    spawn_tool = SpawnTool(manager=subagent_manager)
+    create_goal_tool = CreateGoalTool(sessions=session_manager)
+    update_goal_tool = UpdateGoalTool(sessions=session_manager)
+    registry.register(spawn_tool)
+    registry.register(create_goal_tool)
+    registry.register(update_goal_tool)
+
     replay_budget = _DEMO_CONTEXT_WINDOW - _DEMO_MAX_TOKENS - _SAFETY_BUFFER
-    bus = MessageBus()
 
     agent_loop = AgentLoop(
         bus=bus,
@@ -57,6 +75,7 @@ async def main():
         memory=memory,
         identity=identity,
         replay_budget=replay_budget,
+        subagent_manager=subagent_manager,
     )
     loop_task = asyncio.create_task(agent_loop.run())
     dream_task = asyncio.create_task(_dream_loop(agent_loop))
@@ -64,7 +83,8 @@ async def main():
     print(f"Session key: {session_key}")
     print(f"Context window: {_DEMO_CONTEXT_WINDOW}, replay budget: {replay_budget}")
     print(f"Dream interval: {_DREAM_INTERVAL_SECONDS}s")
-    print("Type /exit to quit, /history to show history, /new to reset, /dream to trigger now\n")
+    print("Type /exit to quit, /history to show history, /new to reset, /dream to trigger now")
+    print("Commands: spawn <task> | /goal <objective>\n")
 
     try:
         while True:
@@ -92,6 +112,9 @@ async def main():
                     extra = f" ({name})" if name else ""
                     lc = " <-- last_consolidated" if i == session.last_consolidated else ""
                     print(f"  [{i}] {role}{content}{extra}{lc}")
+                goal_lines = goal_state_runtime_lines(session.metadata)
+                if goal_lines:
+                    print("  [goal] " + " | ".join(goal_lines[:2]))
                 print("---\n")
                 continue
 
