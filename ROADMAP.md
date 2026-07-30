@@ -1,153 +1,118 @@
-# 从零构建 nanobot：最小增量路线图
+# lean_nanobot — 路线图
 
-共 **7 个阶段 19 步**，每步都是可独立运行的最简增量。
-
----
-
-## Phase 0：最简 LLM 调用
-
-### Step 0 — 裸 HTTP 调用（~30 行）
-- 用 `httpx` POST 到 OpenAI-compatible API
-- 硬编码 URL / API key / model
-- `python main.py "你好"` → 打印回复
-- 纯同步，单文件，没有任何抽象
+按最小增量对齐 nanobot 架构，复杂功能拆分为独立步骤。
 
 ---
 
-## Phase 1：Provider 抽象
+## 已完成
 
-### Step 1 — Provider 基类 + OpenAI 实现（+2 文件）
-- `LLMProvider(ABC)` with `async chat(messages) → LLMResponse`
-- `OpenAICompatProvider` 实现
-- `LLMResponse(content, tool_calls, finish_reason)` dataclass
-- `main.py` 改为 async，效果同上但可复用
-
-### Step 2 — 流式支持
-- `chat_stream(messages, *, on_content_delta)` 默认回退到 `chat`
-- `OpenAICompatProvider` 覆盖为真正的 SSE 流式
-- CLI 逐 token 打印输出
-
-### Step 3 — 带重试的调用
-- `chat_with_retry()` / `chat_stream_with_retry()` 封装重试逻辑
-- 区分临时错误 (429/5xx) vs 不可重试 (quota)
+| Step | 主题 | 核心文件 | 测试数 |
+|------|------|----------|--------|
+| 0–12 | 基础演进 | — | — |
+| 13 | Context Governance | governance.py | 104 |
+| 14 | Governance 增强 | governance.py + helpers.py | 104 |
+| 15 | Consolidation + Dream + MemoryStore | memory.py + consolidation.py | 128 |
+| 16 | Subagents + Sustained Goals | subagent.py + long_task.py + goal_state.py | 156 |
 
 ---
 
-## Phase 2：Agent Runner + 工具
+## Step 17a — Governance & Tool Execution Safety
 
-### Step 4 — Tool 基类 + Registry
-- `Tool(ABC)` with `name`, `description`, `parameters` (JSON Schema)
-- `ToolResult(content, is_error)`
-- `ToolRegistry.register()`, `get_definitions()` (输出 OpenAI 格式)
-- 一个工具：`echo_tool`（回显参数，测试用）
+**主题：** AgentRunner 可靠性增强（基础安全层）
 
-### Step 5 — AgentRunner 单轮工具
-- `AgentRunner.run(spec: AgentRunSpec)`：
-  1. 发送 messages + tools → LLM
-  2. 如果有 `tool_calls` → `ToolRegistry.execute()` → 追加 result
-  3. 继续发回 LLM（最多 `max_iterations` 次）
-  4. 直到 LLM 返回文本 → 结束
+| 改进 | 行数 |
+|------|------|
+| ContextGovernor 默认集成 | ~20 |
+| 并发工具执行 | ~50 |
+| 工具结果归一化 | ~20 |
+| 格式错误工具调用处理 | ~20 |
+| LLM 超时 | ~15 |
+| 测试 | ~50 |
 
-### Step 6 — ContextBuilder（系统提示）
-- `ContextBuilder.build_system_prompt()` 组装 identity
-- 读取 `AGENTS.md` / `SOUL.md` / `USER.md` 作为引导文件
-- `build_messages(history, current_message)` → `[system, *history, user]`
+**目标测试数：** ~206
 
 ---
 
-## Phase 3：多轮会话
+## Step 17b — Content Recovery & Continuation Control
 
-### Step 7 — Session
-- `Session(key, messages[], metadata{})` dataclass
-- `SessionManager.get_or_create(key)` → 从文件加载 / 新建
-- JSON 文件持久化 `workspace/sessions/{key}.json`
-- `add_message(role, content)` / `get_history(max_messages)`
+**主题：** AgentRunner 完成度保障（响应质量）
 
-### Step 8 — 自动压缩
-- `last_consolidated` 指针标记已处理边界
-- 超 `max_messages` / `max_tokens` 时截断老消息
-- `Consolidator.archive(messages)` → LLM 摘要 → `history.jsonl`
+| 改进 | 行数 |
+|------|------|
+| 空内容重试 | ~25 |
+| Token 耗尽续行 | ~20 |
+| Goal 续行封顶 | ~15 |
+| 注入周期控制 + 合并 | ~30 |
+| 测试 | ~50 |
 
----
-
-## Phase 4：AgentLoop 状态机 + 总线
-
-### Step 9 — MessageBus
-- `MessageBus()`：两个 `asyncio.Queue`（inbound / outbound）
-- `InboundMessage(channel, sender_id, chat_id, content)`
-- `OutboundMessage(channel, chat_id, content)`
-
-### Step 10 — AgentLoop 状态机（最简版 5 态）
-```
-RESTORE → BUILD → RUN → SAVE → RESPOND → DONE
-```
-- `_process_message()` → while state != DONE: `handler = getattr(self, f"_state_{state}")`
-- `_state_build()` → ContextBuilder 组装 messages
-- `_state_run()` → AgentRunner.run()
-- `_state_save()` → Session.add() + 持久化
-- `run()` 主循环：`while running: msg = bus.consume_inbound() → _dispatch(msg)`
+**目标测试数：** ~256
 
 ---
 
-## Phase 5：流式 + 钩子
+## Step 18 — ToolLoader & Tool System Upgrade
 
-### Step 11 — Hook 系统
-- `AgentHook` with `before_run`, `after_run`, `before_iteration`, `after_iteration`, `on_stream`, `on_error`
-- `AgentRunHookContext` / `AgentHookContext` 传递状态
-- `AgentRunner.run()` 注入 hook 生命周期
+**主题：** 工具系统升级为 nanobot 风格
 
-### Step 12 — 流式集成到 AgentLoop
-- `on_stream` / `on_stream_end` callbacks → bus 发布 `StreamDeltaEvent`
-- 流式时阻断最终响应直到流结束
+| 改进 | 说明 |
+|------|------|
+| ToolLoader | `pkgutil.iter_modules` + `entry_points` 自动发现 |
+| 安全边界 | SSRF 保护、workspace 违规检测 |
+| ContextVar 状态 | `RequestContext` / `ToolContext` ContextVar 注入 |
+| RuntimeContextProvider | 工具向 system prompt 注入运行时上下文块 |
+| 参数校验 | `prepare_call()` → JSON Schema 校验 + 类型强转 |
+| `Tool` 基类增强 | `read_only`, `exclusive`, `concurrency_safe`, `cast_params`, `validate_params` |
 
----
-
-## Phase 6：高级特性
-
-### Step 13 — 回合中注入 (Mid-turn injection)
-- `_pending_queues[session_key] = asyncio.Queue(maxsize=20)`
-- `AgentRunner` 通过 `injection_callback` 抽取注入消息
-- 每轮工具执行后 / 最终响应前 drain
-
-### Step 14 — Context Governance
-- `ContextGovernor.prepare_for_model()`: 角色轮换修复、孤儿 tool_result 清理、空内容填充
-- `estimate_message_tokens()` 预算检查
-- `ContextGovernanceConfig` 配置
-
-### Step 15 — Consolidation + Dream
-- Token 预算 consolidation：BUILD 阶段检查，超标则摘要归档
-- Dream 阶段：临时 agent 回合把 `history.jsonl` 蒸馏到 `MEMORY.md`
-- `.dream_cursor` 追踪处理位置
-
-### Step 16 — Subagents + Sustained Goals
-- `SubagentManager`: 生成子 agent 回合，结果作为注入消息返回
-- 目标状态跟踪：`goal_state_runtime_lines()` → 自动注入 "继续工作" 消息
-- `long_task.py`: 长时间运行任务支持
+**导入：** 从 step17b fork，import `step17b.` → `step18.`
 
 ---
 
-## Phase 7：通道 + 插件体系
+## Step 19 — Session System Upgrade
 
-### Step 17 — Channel 抽象
-- `Channel(ABC)` with `start()`, `stop()`, 内部 consume_outbound
-- CLI channel、WebSocket channel 实现
-- 通过 MessageBus 与 AgentLoop 解耦
+**主题：** 会话管理升级为 nanobot 风格
 
-### Step 18 — MCP + Skills + 插件
-- MCP 服务器连接 → 工具自动发现
-- `SkillsLoader.load_skills_for_context()` → 注入系统提示
-- `ToolLoader` pkgutil 自动发现 + entry_points 插件
+| 改进 | 说明 |
+|------|------|
+| base64url 文件名编码 | 替代 `:` → `_` 转义 |
+| 两级缓存 | `OrderedDict` (128 hot) + `WeakValueDictionary` overflow |
+| AutoCompact | TTL 驱动的空闲会话压缩 |
+| 文件上限强制 | `enforce_file_cap(2000)` |
+| Pending user turn restore | 崩溃恢复 |
+| Fork session | `fork_session_before_user_index()` |
 
-### Step 19 — Config 体系
-- Pydantic schema + JSON 文件加载
-- Provider/工具/通道配置
+**导入：** 从 step18 fork，import `step18.` → `step19.`
 
 ---
 
-## 关键设计原则
+## Step 20 — Channel Framework
 
-```
-每步完成后都能 RUN 起来看到效果
-每个新功能只增加一个文件或给已有文件加一个方法
-绝不提前抽象不需要的东西
-```
+**主题：** 通道框架
+
+| 改进 | 说明 |
+|------|------|
+| BaseChannel ABC | `start()`, `stop()`, `send()`, `_handle_message()` |
+| ChannelManager | 发现、初始化、启动/停止，路由 outbound 消息 |
+| Permission system | `is_allowed()`, pairing, `allowFrom` |
+| Stream delivery | `send_delta()` streaming 支持 |
+| CLI channel | 第一个实现 |
+
+**导入：** 从 step19 fork，import `step19.` → `step20.`
+
+---
+
+## 未来候选
+
+| Step | 主题 | 说明 |
+|------|------|------|
+| 21 | Providers Registry & Factory | nanobot 风格的 provider 注册/匹配/fallback |
+| 22 | Configuration | Pydantic config schema |
+| 23 | Gateway & HTTP API | WebSocket gateway + OpenAI-compatible HTTP API |
+| 24 | MCP Integration | Model Context Protocol tools |
+
+---
+
+## 设计原则
+
+1. **最小增量** — 每步只改最少的文件，独立可测试
+2. **向后兼容** — AgentRunSpec、AgentLoop 接口只加可选字段
+3. **可拆分** — 复杂功能跨步骤，步间可通过 fork + import 变更串联
+4. **测试先行** — 每步增加相应测试，不破坏原有测试

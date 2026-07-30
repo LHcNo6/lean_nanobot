@@ -6,20 +6,20 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import Any
 
-from step16.bus import MessageBus
-from step16.consolidation import Consolidator
-from step16.context import ContextBuilder
-from step16.events import InboundMessage, OutboundMessage, StreamDeltaEvent
-from step16.goal_state import goal_state_runtime_lines, sustained_goal_active
-from step16.hook import AgentHook, AgentHookContext, CompositeHook
-from step16.llm import LLMResponse, Runtime, ToolCallRequest
-from step16.memory import MemoryStore
-from step16.runner import AgentRunResult, AgentRunSpec, AgentRunner
-from step16.session import Session, SessionManager
-from step16.subagent import SubagentManager
-from step16.tool import ToolRegistry
-from step16.tools.long_task import CreateGoalTool, UpdateGoalTool
-from step16.tools.spawn import SpawnTool
+from step17b.bus import MessageBus
+from step17b.consolidation import Consolidator
+from step17b.context import ContextBuilder
+from step17b.events import InboundMessage, OutboundMessage, StreamDeltaEvent
+from step17b.goal_state import goal_state_runtime_lines, sustained_goal_active
+from step17b.hook import AgentHook, AgentHookContext, CompositeHook
+from step17b.llm import LLMResponse, Runtime, ToolCallRequest
+from step17b.memory import MemoryStore
+from step17b.runner import AgentRunResult, AgentRunSpec, AgentRunner
+from step17b.session import Session, SessionManager
+from step17b.subagent import SubagentManager
+from step17b.tool import ToolRegistry
+from step17b.tools.long_task import CreateGoalTool, UpdateGoalTool
+from step17b.tools.spawn import SpawnTool
 
 
 class TurnState(Enum):
@@ -66,6 +66,9 @@ class StreamPublishingHook(AgentHook):
             content="", channel=self.channel, chat_id=self.chat_id,
             finished=True, session_key=self.session_key,
         ))
+
+    def wants_streaming(self) -> bool:
+        return True
 
 
 class AgentLoop:
@@ -217,7 +220,6 @@ class AgentLoop:
         session_key = ctx.session_key
         self._create_goal_tool.set_session_key(session_key)
         self._update_goal_tool.set_session_key(session_key)
-        self._spawn_tool.set_session_key(session_key)
 
         self.registry.register(self._spawn_tool)
         self.registry.register(self._create_goal_tool)
@@ -230,18 +232,9 @@ class AgentLoop:
         ))
         hook = CompositeHook(hooks) if len(hooks) > 1 else hooks[0]
 
-        async def injection_callback():
-            queue = self._pending_queues.get(session_key)
-            if queue is None or queue.empty():
-                return []
-            msgs = []
-            while not queue.empty():
-                try:
-                    m = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                msgs.append({"role": "user", "content": m.content})
-            return msgs
+        rounds = 0
+        if ctx.session:
+            rounds = ctx.session.metadata.get("_goal_continuation_rounds", 0)
 
         spec = AgentRunSpec(
             initial_messages=ctx.initial_messages,
@@ -250,11 +243,15 @@ class AgentLoop:
             max_iterations=5,
             hook=hook,
             session_key=session_key,
-            injection_callback=injection_callback,
             goal_active_predicate=lambda: sustained_goal_active(ctx.session.metadata) if ctx.session else False,
             goal_continue_message=self._goal_continue_message,
+            goal_continuation_rounds=rounds,
         )
         ctx.result = await self._runner.run(spec)
+
+        new_rounds = spec.goal_continuation_rounds
+        if ctx.session and new_rounds > rounds:
+            ctx.session.metadata["_goal_continuation_rounds"] = new_rounds
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:

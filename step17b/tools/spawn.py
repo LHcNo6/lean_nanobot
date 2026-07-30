@@ -1,20 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from step16.tool import Tool, ToolResult
+from step17b.tool import Tool, ToolResult
 
 if TYPE_CHECKING:
-    from step16.subagent import SubagentManager
+    from step17b.subagent import SubagentManager
 
 
 class SpawnTool(Tool):
-    def __init__(self, manager: SubagentManager | None = None, session_key: str | None = None):
+    def __init__(self, manager: SubagentManager | None = None):
         self._manager = manager
-        self._session_key = session_key
-
-    def set_session_key(self, key: str) -> None:
-        self._session_key = key
 
     @property
     def name(self) -> str:
@@ -46,5 +42,5 @@ class SpawnTool(Tool):
         if not task:
             return ToolResult.error("Task must not be empty.")
         label = kwargs.get("label")
-        result = await self._manager.spawn(task=task, label=label, session_key=self._session_key)
+        result = await self._manager.spawn(task=task, label=label)
         return ToolResult(result)
