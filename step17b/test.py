@@ -2833,6 +2833,44 @@ class TestGoalContinuationMaxRounds(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.goal_continuation_rounds, 0)
 
+    async def test_runner_writes_back_rounds_to_spec(self):
+        """Runner syncs the final continuation count back to AgentRunSpec."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=_GoalCappingProvider(),
+            max_iterations=20,
+            goal_active_predicate=lambda: True,
+            goal_continue_message="Continue working",
+            goal_continuation_rounds=0,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertEqual(result.goal_continuation_rounds, 12)
+        self.assertEqual(spec.goal_continuation_rounds, 12)
+
+    async def test_loop_state_run_persists_rounds_to_session(self):
+        """_state_run persists goal continuation rounds into session metadata."""
+        loop, _ = _make_injection_loop(provider=_GoalCappingProvider())
+        session = Session(key="goal_test")
+        session.metadata["goal_state"] = {"status": "active", "objective": "test"}
+        ctx = TurnContext(
+            msg=InboundMessage(content="hello", chat_id="goal_test"),
+            session_key="goal_test",
+        )
+        ctx.session = session
+        ctx.summary = None
+        ctx.history = []
+        ctx.initial_messages = [{"role": "user", "content": "hello"}]
+
+        await loop._state_run(ctx)
+        first_rounds = ctx.session.metadata.get("_goal_continuation_rounds", 0)
+        self.assertGreater(first_rounds, 0)
+        self.assertEqual(ctx.result.goal_continuation_rounds, first_rounds)
+
+        await loop._state_run(ctx)
+        second_rounds = ctx.session.metadata.get("_goal_continuation_rounds", 0)
+        self.assertGreater(second_rounds, first_rounds)
+
 
 # ---- Step 17b Tests: Injection Cycles Limit & Merge ----
 

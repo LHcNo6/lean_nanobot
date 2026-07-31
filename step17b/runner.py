@@ -98,6 +98,7 @@ class AgentRunner:
             await hook.on_error(run_ctx)
             raise
         else:
+            spec.goal_continuation_rounds = result.goal_continuation_rounds
             run_ctx.final_content = result.final_content
             run_ctx.tools_used = list(result.tools_used)
             run_ctx.usage = dict(result.usage)
