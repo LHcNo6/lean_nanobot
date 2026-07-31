@@ -2603,6 +2603,66 @@ class TestLLMTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.stop_reason, "error")
 
 
+# ---- Step 17b Tests: Error Termination ----
+
+class _CountingTimeoutProvider(LLMProvider):
+    """Always times out; counts calls."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        await asyncio.sleep(10)
+        return LLMResponse(content="too late", finish_reason="stop",
+                           usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        return await self.chat(messages, tools, model, temperature, max_tokens)
+
+
+class TestErrorTermination(unittest.IsolatedAsyncioTestCase):
+    async def test_error_with_active_goal_stops_immediately(self):
+        """LLM error terminates instead of triggering goal continuation."""
+        provider = _CountingTimeoutProvider()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=provider,
+            llm_timeout_s=0.05,
+            max_iterations=20,
+            goal_active_predicate=lambda: True,
+            goal_continue_message="Continue working",
+        )
+        result = await AgentRunner().run(spec)
+        self.assertEqual(result.stop_reason, "error")
+        self.assertEqual(result.goal_continuation_rounds, 0)
+        self.assertLessEqual(provider.call_count, 2)
+
+    async def test_error_with_injection_callback(self):
+        """LLM error terminates without draining injections."""
+        injector = _InjectingCallback(count=10, msg_count=1)
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=_SlowProvider(),
+            llm_timeout_s=0.05,
+            max_iterations=20,
+            injection_callback=injector.callback,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertEqual(result.stop_reason, "error")
+        self.assertEqual(injector.total_calls, 0)
+        user_msgs = [m for m in result.messages if m["role"] == "user"]
+        self.assertEqual(len(user_msgs), 1)
+
+
 # ---- Step 17b Tests: Empty Content Retry ----
 
 class _EmptyResponseProvider(LLMProvider):

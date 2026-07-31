@@ -122,6 +122,23 @@ class AgentRunner:
     def _is_blank_text(text: str | None) -> bool:
         return not text or not text.strip()
 
+    @staticmethod
+    def _error_result(
+        messages: list[dict[str, Any]],
+        tools_used: list[str],
+        total_usage: dict[str, int],
+        response: LLMResponse,
+        goal_continuation_rounds: int,
+    ) -> AgentRunResult:
+        return AgentRunResult(
+            final_content=response.content or "",
+            messages=messages,
+            tools_used=tools_used,
+            usage=total_usage,
+            stop_reason="error",
+            goal_continuation_rounds=goal_continuation_rounds,
+        )
+
     async def _request_model(
         self,
         spec: AgentRunSpec,
@@ -284,6 +301,15 @@ class AgentRunner:
             iter_ctx.usage = dict(total_usage)
             await hook.on_stream_end(iter_ctx)
 
+            if response.finish_reason == "error":
+                iter_ctx.final_content = response.content or ""
+                iter_ctx.stop_reason = "error"
+                await hook.after_iteration(iter_ctx)
+                return self._error_result(
+                    messages, tools_used, total_usage,
+                    response, goal_continuation_rounds,
+                )
+
             if response.tool_calls and response.finish_reason == "tool_calls":
                 valid_calls = self._drop_malformed_tool_calls(response.tool_calls)
                 if not valid_calls:
@@ -340,6 +366,14 @@ class AgentRunner:
                 iter_ctx.response = response
                 iter_ctx.usage = dict(total_usage)
                 await hook.on_stream_end(iter_ctx)
+                if response.finish_reason == "error":
+                    iter_ctx.final_content = response.content or ""
+                    iter_ctx.stop_reason = "error"
+                    await hook.after_iteration(iter_ctx)
+                    return self._error_result(
+                        messages, tools_used, total_usage,
+                        response, goal_continuation_rounds,
+                    )
                 clean = response.content or ""
 
             if response.finish_reason == "length" and not self._is_blank_text(clean):
