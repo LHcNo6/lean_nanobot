@@ -38,7 +38,7 @@ def goal_state_runtime_lines(metadata: Mapping[str, Any] | None) -> list[str]:
     if not objective:
         return ["Goal: active (no objective text stored)."]
     if len(objective) > MAX_GOAL_OBJECTIVE_CHARS:
-        objective = objective[:MAX_GOAL_OBJECTIVE_CHARS].rstrip() + "\n鈥?(truncated)"
+        objective = objective[:MAX_GOAL_OBJECTIVE_CHARS].rstrip() + "\n... (truncated)"
     out = ["Goal (active):", objective]
     hint = str(goal.get("ui_summary") or "").strip()
     if hint:
