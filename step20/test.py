@@ -1,0 +1,4652 @@
+"""Tests for Step 16 �� Subagents + Sustained Goals."""
+
+import asyncio
+import gc
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+from step20.autocompact import AutoCompact
+from step20.bus import MessageBus
+from step20.channel import BaseChannel
+from step20.channels.cli import CliChannel
+from step20.consolidation import Consolidator, _consolidation_boundary
+from step20.goal_state import *
+from step20.helpers import estimate_message_tokens, estimate_prompt_tokens
+from step20.llm import Runtime
+from step20.memory import MemoryStore
+from step20.context import ContextBuilder
+from step20.events import InboundMessage, OutboundMessage, StreamDeltaEvent
+from step20.hook import AgentHook, AgentHookContext, AgentRunHookContext, CompositeHook
+from step20.llm import LLMResponse, ToolCallRequest
+from step20.loop import AgentLoop, StreamPublishingHook, TurnContext, TurnState
+from step20.manager import ChannelManager
+from step20.pairing import PAIRING_CODE_META_KEY, PairingStore
+from step20.provider import LLMProvider
+from step20.governance import ContextGovernanceConfig, ContextGovernor
+from step20.runner import AgentRunSpec, AgentRunner
+from step20.session import Session, SessionManager
+from step20.subagent import SubagentManager, SubagentStatus
+from step20.tool import ToolRegistry, Tool
+from step20.tools.long_task import CreateGoalTool, UpdateGoalTool
+from step20.tools.echo import EchoTool
+from step20.tools.spawn import SpawnTool
+from step20.events import StreamDeltaEvent
+
+
+async def _consume_final_response(bus):
+    """Consume outbound messages, skipping stream deltas, until the final response."""
+    while True:
+        msg = await bus.consume_outbound()
+        if not isinstance(msg, StreamDeltaEvent):
+            return msg
+
+
+class _MockProvider(LLMProvider):
+    def __init__(self, response: LLMResponse | None = None):
+        super().__init__()
+        self._response = response
+
+    @property
+    def model(self) -> str:
+        return "mock-model"
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        if self._response is not None:
+            return self._response
+        return LLMResponse(
+            content="Summary: user asked about weather, assistant provided forecast.",
+            finish_reason="stop",
+            usage={"prompt_tokens": 50, "completion_tokens": 30},
+        )
+
+
+class _MockToolRegistry:
+    def __init__(self):
+        self._tools = {}
+
+    def register(self, tool):
+        self._tools[tool.name] = tool
+
+    def get_definitions(self):
+        return []
+
+    async def execute(self, name, **params):
+        return ""
+
+    def get(self, name):
+        return self._tools.get(name)
+
+
+# ���� Hook Tests ����
+
+class _TrackingHook(AgentHook):
+    """Records every hook invocation for verification."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+        self.before_run_ctx: AgentRunHookContext | None = None
+        self.after_run_ctx: AgentRunHookContext | None = None
+        self.on_error_ctx: AgentRunHookContext | None = None
+        self.on_finally_ctx: AgentRunHookContext | None = None
+        self.before_iter_ctxs: list[AgentHookContext] = []
+        self.after_iter_ctxs: list[AgentHookContext] = []
+
+    async def before_run(self, ctx):
+        self.calls.append("before_run")
+        self.before_run_ctx = ctx
+
+    async def after_run(self, ctx):
+        self.calls.append("after_run")
+        self.after_run_ctx = ctx
+
+    async def on_error(self, ctx):
+        self.calls.append("on_error")
+        self.on_error_ctx = ctx
+
+    async def on_finally(self, ctx):
+        self.calls.append("on_finally")
+        self.on_finally_ctx = ctx
+
+    async def before_iteration(self, ctx):
+        self.calls.append("before_iteration")
+        self.before_iter_ctxs.append(ctx)
+
+    async def after_iteration(self, ctx):
+        self.calls.append("after_iteration")
+        self.after_iter_ctxs.append(ctx)
+
+
+class _ErrorHook(AgentHook):
+    """Raises in a specific method for isolation tests."""
+
+    def __init__(self, fail_in: str = "before_iteration"):
+        self.fail_in = fail_in
+
+    async def before_iteration(self, ctx):
+        if self.fail_in == "before_iteration":
+            raise RuntimeError("hook error")
+
+    async def after_iteration(self, ctx):
+        if self.fail_in == "after_iteration":
+            raise RuntimeError("hook error")
+
+
+class TestHookLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def test_before_run_called(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertIn("before_run", hook.calls)
+
+    async def test_after_run_called_on_success(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertIn("after_run", hook.calls)
+        self.assertIsNotNone(hook.after_run_ctx)
+        self.assertIsNotNone(hook.after_run_ctx.final_content)
+
+    async def test_on_error_called_on_exception(self):
+        hook = _TrackingHook()
+
+        class _FailProvider(LLMProvider):
+            @property
+            def model(self):
+                return "mock"
+            async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+                raise RuntimeError("provider failure")
+
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_FailProvider(),
+            hook=hook,
+        )
+        with self.assertRaises(RuntimeError):
+            await AgentRunner().run(spec)
+        self.assertIn("on_error", hook.calls)
+        self.assertIsNotNone(hook.on_error_ctx)
+        self.assertIsInstance(hook.on_error_ctx.exception, RuntimeError)
+
+    async def test_on_finally_always_called(self):
+        hook = _TrackingHook()
+
+        class _FailProvider(LLMProvider):
+            @property
+            def model(self):
+                return "mock"
+            async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+                raise RuntimeError("fail")
+
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_FailProvider(),
+            hook=hook,
+        )
+        with self.assertRaises(RuntimeError):
+            await AgentRunner().run(spec)
+        self.assertIn("on_finally", hook.calls)
+        self.assertIsNotNone(hook.on_finally_ctx)
+
+        # on_finally also called on success
+        hook2 = _TrackingHook()
+        spec2 = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook2,
+        )
+        await AgentRunner().run(spec2)
+        self.assertIn("on_finally", hook2.calls)
+
+    async def test_before_iteration_called(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertIn("before_iteration", hook.calls)
+        self.assertEqual(len(hook.before_iter_ctxs), 1)
+
+    async def test_after_iteration_called(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertIn("after_iteration", hook.calls)
+        self.assertEqual(len(hook.after_iter_ctxs), 1)
+
+    async def test_iteration_context_state(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        ctx = hook.after_iter_ctxs[0]
+        self.assertEqual(ctx.iteration, 0)
+        self.assertGreaterEqual(len(ctx.messages), 1)
+        self.assertIsNotNone(ctx.response)
+        self.assertIsNotNone(ctx.final_content)
+        self.assertIn("Summary", ctx.final_content)
+        self.assertIn("prompt_tokens", ctx.usage)
+
+    async def test_run_context_state(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        ctx = hook.after_run_ctx
+        self.assertIsNotNone(ctx)
+        self.assertIsNotNone(ctx.final_content)
+        self.assertEqual(ctx.stop_reason, "stop")
+        self.assertIn("Summary", ctx.final_content)
+
+    async def test_composite_hook_fanout(self):
+        h1 = _TrackingHook()
+        h2 = _TrackingHook()
+        composite = CompositeHook([h1, h2])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=composite,
+        )
+        await AgentRunner().run(spec)
+        for h in (h1, h2):
+            self.assertIn("before_run", h.calls)
+            self.assertIn("after_run", h.calls)
+            self.assertIn("before_iteration", h.calls)
+            self.assertIn("after_iteration", h.calls)
+            self.assertIn("on_finally", h.calls)
+
+    async def test_hook_error_isolation(self):
+        tracking = _TrackingHook()
+        error_hook = _ErrorHook(fail_in="before_iteration")
+        composite = CompositeHook([tracking, error_hook])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=composite,
+        )
+        # Should not raise �� CompositeHook isolates errors
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.final_content)
+        # tracking hook should still have been called despite error_hook failing
+        self.assertIn("before_iteration", tracking.calls)
+
+    async def test_custom_hook_usage_tracker(self):
+        class UsageTracker(AgentHook):
+            def __init__(self):
+                self.total_prompt = 0
+                self.total_completion = 0
+
+            async def after_iteration(self, ctx):
+                self.total_prompt += ctx.usage.get("prompt_tokens", 0)
+                self.total_completion += ctx.usage.get("completion_tokens", 0)
+
+        hook = UsageTracker()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertGreater(hook.total_prompt, 0)
+        self.assertGreater(hook.total_completion, 0)
+
+    async def test_session_key_in_context(self):
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            hook=hook,
+            session_key="test_sess",
+        )
+        await AgentRunner().run(spec)
+        for ctx in hook.before_iter_ctxs:
+            self.assertEqual(ctx.session_key, "test_sess")
+
+
+class TestHookWithToolIterations(unittest.IsolatedAsyncioTestCase):
+    async def test_multiple_iterations_with_tools(self):
+        class _EchoToolRegistry:
+            def __init__(self):
+                self.executed = []
+
+            def get_definitions(self):
+                return [{"type": "function", "function": {"name": "echo", "description": "echo", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}}]  # noqa: E501
+
+            async def execute(self, name, **params):
+                self.executed.append((name, params))
+                return ToolResult(f"Echo: {params.get('text', '')}")
+
+        class _ToolCallProvider(LLMProvider):
+            @property
+            def model(self):
+                return "mock"
+            async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+                is_first = messages[-1].get("role") == "user" if messages else True
+                if is_first:
+                    return LLMResponse(
+                        content="",
+                        tool_calls=[ToolCallRequest(id="call_1", name="echo", arguments={"text": "hello"})],
+                        finish_reason="tool_calls",
+                        usage={"prompt_tokens": 50, "completion_tokens": 10},
+                    )
+                return LLMResponse(
+                    content="Done after tool call.",
+                    finish_reason="stop",
+                    usage={"prompt_tokens": 60, "completion_tokens": 5},
+                )
+
+        hook = _TrackingHook()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_EchoToolRegistry(),
+            provider=_ToolCallProvider(),
+            hook=hook,
+            max_iterations=3,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertGreater(len(hook.before_iter_ctxs), 1)
+        # Each iteration should have tool_calls populated
+        for ctx in hook.before_iter_ctxs:
+            self.assertIsNotNone(ctx)
+
+
+from step20.tool import ToolResult
+
+
+class TestAgentLoopWithHook(unittest.IsolatedAsyncioTestCase):
+    def _make_loop(self, hooks=None):
+        bus = MessageBus()
+        provider = _MockProvider()
+        registry = _MockToolRegistry()
+        tmp = tempfile.mkdtemp()
+        session_manager = SessionManager(workspace=tmp)
+        context_builder = ContextBuilder(workspace=".")
+        memory = MemoryStore(workspace=tmp)
+        loop = AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=session_manager, context_builder=context_builder,
+            memory=memory, identity="You are a test bot.",
+            replay_budget=10000, hooks=hooks,
+        )
+        return loop, bus
+
+    async def test_loop_with_hook(self):
+        hook = _TrackingHook()
+        loop, bus = self._make_loop(hooks=[hook])
+        task = asyncio.create_task(loop.run())
+        await bus.publish_inbound(InboundMessage(content="hello"))
+        response = await _consume_final_response(bus)
+        self.assertIsNotNone(response.content)
+        self.assertIn("before_run", hook.calls)
+        self.assertIn("after_run", hook.calls)
+        self.assertIn("before_iteration", hook.calls)
+        self.assertIn("after_iteration", hook.calls)
+        self.assertIn("on_finally", hook.calls)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+# ── Streaming Tests ──
+
+class _TrackingHookForStream(AgentHook):
+    def __init__(self):
+        self.stream_deltas: list[str] = []
+        self.stream_end_count = 0
+        self.iter_stream_contents: list[str] = []
+
+    async def on_stream(self, ctx: AgentHookContext, delta: str) -> None:
+        self.stream_deltas.append(delta)
+
+    async def on_stream_end(self, ctx: AgentHookContext) -> None:
+        self.stream_end_count += 1
+        self.iter_stream_contents.append(ctx.stream_content)
+
+
+class _StreamingMockProvider(LLMProvider):
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        return LLMResponse(
+            content="Hello world!",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+        )
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        chunks = ["Hello", " ", "world", "!"]
+        for chunk in chunks:
+            if on_content_delta:
+                await on_content_delta(chunk)
+            await asyncio.sleep(0)
+        return LLMResponse(
+            content="Hello world!",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+        )
+
+
+class _StreamingToolCallProvider(LLMProvider):
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        is_first = messages[-1].get("role") == "user" if messages else True
+        if is_first:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="call_1", name="echo", arguments={"text": "hello"})],
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 50, "completion_tokens": 10},
+            )
+        return LLMResponse(
+            content="Done after tool call.",
+            finish_reason="stop",
+            usage={"prompt_tokens": 60, "completion_tokens": 5},
+        )
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        is_first = messages[-1].get("role") == "user" if messages else True
+        if is_first:
+            if on_content_delta:
+                await on_content_delta("")
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="call_1", name="echo", arguments={"text": "hello"})],
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 50, "completion_tokens": 10},
+            )
+        chunks = ["Done ", "after ", "tool ", "call."]
+        for chunk in chunks:
+            if on_content_delta:
+                await on_content_delta(chunk)
+            await asyncio.sleep(0)
+        return LLMResponse(
+            content="Done after tool call.",
+            finish_reason="stop",
+            usage={"prompt_tokens": 60, "completion_tokens": 5},
+        )
+
+
+class _EchoToolRegistryForStream:
+    def get_definitions(self):
+        return [{"type": "function", "function": {"name": "echo", "description": "echo", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}}]
+
+    async def execute(self, name, **params):
+        return f"Echo: {params.get('text', '')}"
+
+
+class TestStreamingHooks(unittest.IsolatedAsyncioTestCase):
+    async def test_on_stream_called_with_deltas(self):
+        hook = _TrackingHookForStream()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_StreamingMockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertEqual(hook.stream_deltas, ["Hello", " ", "world", "!"])
+
+    async def test_stream_content_accumulated(self):
+        hook = _TrackingHookForStream()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_StreamingMockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertEqual(hook.iter_stream_contents[-1], "Hello world!")
+
+    async def test_on_stream_end_called(self):
+        hook = _TrackingHookForStream()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_StreamingMockProvider(),
+            hook=hook,
+        )
+        await AgentRunner().run(spec)
+        self.assertEqual(hook.stream_end_count, 1)
+
+    async def test_no_stream_when_tool_calls(self):
+        hook = _TrackingHookForStream()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_EchoToolRegistryForStream(),
+            provider=_StreamingToolCallProvider(),
+            hook=hook,
+            max_iterations=3,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # First iteration (tool_calls): no content delta expected
+        # Second iteration (text): deltas expected
+        self.assertGreater(len(hook.stream_deltas), 0)
+        self.assertEqual(hook.stream_end_count, 2)
+
+    async def test_stream_usage_accumulated(self):
+        hook = _TrackingHookForStream()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_StreamingMockProvider(),
+            hook=hook,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertGreater(result.total_prompt_tokens, 0)
+        self.assertGreater(result.total_completion_tokens, 0)
+
+
+class TestStreamPublishingHook(unittest.IsolatedAsyncioTestCase):
+    async def test_publishes_deltas_to_bus(self):
+        bus = MessageBus()
+        stream_hook = StreamPublishingHook(bus=bus, chat_id="test", channel="cli", session_key="sess1")
+
+        ctx = AgentHookContext(iteration=0, messages=[], session_key="sess1")
+        await stream_hook.on_stream(ctx, "Hel")
+        await stream_hook.on_stream(ctx, "lo")
+
+        for expected in ("Hel", "lo"):
+            msg = await bus.consume_outbound()
+            self.assertIsInstance(msg, StreamDeltaEvent)
+            self.assertEqual(msg.content, expected)
+            self.assertFalse(msg.finished)
+            self.assertEqual(msg.session_key, "sess1")
+
+    async def test_publishes_finished_signal(self):
+        bus = MessageBus()
+        stream_hook = StreamPublishingHook(bus=bus, chat_id="test", channel="cli", session_key="sess1")
+
+        ctx = AgentHookContext(iteration=0, messages=[], session_key="sess1")
+        await stream_hook.on_stream_end(ctx)
+
+        msg = await bus.consume_outbound()
+        self.assertIsInstance(msg, StreamDeltaEvent)
+        self.assertTrue(msg.finished)
+        self.assertEqual(msg.session_key, "sess1")
+
+    async def test_skip_empty_delta(self):
+        bus = MessageBus()
+        stream_hook = StreamPublishingHook(bus=bus, chat_id="test", channel="cli", session_key="sess1")
+
+        ctx = AgentHookContext(iteration=0, messages=[], session_key="sess1")
+        await stream_hook.on_stream(ctx, "")
+
+        self.assertEqual(bus.outbound_size, 0)
+
+
+class TestAgentLoopStreaming(unittest.IsolatedAsyncioTestCase):
+    async def _drain_until_outbound(self, bus: MessageBus) -> tuple[list[StreamDeltaEvent], OutboundMessage]:
+        deltas: list[StreamDeltaEvent] = []
+        while True:
+            msg = await bus.consume_outbound()
+            if isinstance(msg, StreamDeltaEvent):
+                deltas.append(msg)
+                if msg.finished:
+                    continue
+            else:
+                return deltas, msg
+
+    def _make_loop(self, hooks=None):
+        bus = MessageBus()
+        provider = _StreamingMockProvider()
+        registry = _MockToolRegistry()
+        tmp = tempfile.mkdtemp()
+        session_manager = SessionManager(workspace=tmp)
+        context_builder = ContextBuilder(workspace=".")
+        memory = MemoryStore(workspace=tmp)
+        loop = AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=session_manager, context_builder=context_builder,
+            memory=memory, identity="You are a test bot.",
+            replay_budget=10000, hooks=hooks,
+        )
+        return loop, bus
+
+    async def test_loop_streaming_end_to_end(self):
+        hook = _TrackingHookForStream()
+        loop, bus = self._make_loop(hooks=[hook])
+        task = asyncio.create_task(loop.run())
+        await bus.publish_inbound(InboundMessage(content="hello", chat_id="stream_test"))
+        deltas, response = await self._drain_until_outbound(bus)
+        self.assertIsNotNone(response.content)
+        self.assertGreater(len(deltas), 0)
+        self.assertTrue(deltas[-1].finished)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_loop_streaming_with_hooks(self):
+        tracking = _TrackingHook()
+        stream_tracking = _TrackingHookForStream()
+        loop, bus = self._make_loop(hooks=[tracking, stream_tracking])
+        task = asyncio.create_task(loop.run())
+        await bus.publish_inbound(InboundMessage(content="hello", chat_id="hook_stream"))
+        deltas, response = await self._drain_until_outbound(bus)
+        self.assertIsNotNone(response.content)
+        self.assertIn("before_run", tracking.calls)
+        self.assertIn("on_finally", tracking.calls)
+        self.assertGreater(len(stream_tracking.stream_deltas), 0)
+        self.assertGreater(len(deltas), 0)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+# ── Existing AgentLoop Tests ──
+
+class TestAgentLoopStateHandlers(unittest.IsolatedAsyncioTestCase):
+    async def test_state_restore(self):
+        loop, _ = self._make_loop()
+        ctx = TurnContext(msg=InboundMessage(content="hi", chat_id="test"), session_key="test")
+        event = await loop._state_restore(ctx)
+        self.assertEqual(event, "ok")
+        self.assertIsNotNone(ctx.session)
+        self.assertEqual(ctx.session.key, "test")
+
+    def _make_loop(self):
+        bus = MessageBus()
+        provider = _MockProvider()
+        registry = _MockToolRegistry()
+        tmp = tempfile.mkdtemp()
+        session_manager = SessionManager(workspace=tmp)
+        context_builder = ContextBuilder(workspace=".")
+        memory = MemoryStore(workspace=tmp)
+        return AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=session_manager, context_builder=context_builder,
+            memory=memory, identity="You are a test bot.",
+            replay_budget=10000,
+        ), bus
+
+    async def test_state_compact_noop(self):
+        loop, _ = self._make_loop()
+        session = Session(key="test")
+        session.add_message("user", "hi")
+        ctx = TurnContext(msg=InboundMessage(content="hi", chat_id="test"), session_key="test")
+        ctx.session = session
+        event = await loop._state_compact(ctx)
+        self.assertEqual(event, "ok")
+        self.assertEqual(ctx.session.last_consolidated, 0)
+
+    async def test_state_compact_with_summary(self):
+        loop, _ = self._make_loop()
+        loop.consolidator.provider = _MockProvider()
+        loop.runtime.context_window_tokens = 4000
+        loop.runtime.max_tokens = 512
+        session = loop.sessions.get_or_create("test")
+        for i in range(20):
+            session.add_message("user", "x" * 500 + str(i))
+        ctx = TurnContext(msg=InboundMessage(content="hi", chat_id="test"), session_key="test")
+        ctx.session = session
+        event = await loop._state_compact(ctx)
+        self.assertEqual(event, "ok")
+        self.assertIsNotNone(ctx.summary)
+        self.assertGreater(session.last_consolidated, 0)
+
+    async def test_state_build(self):
+        loop, _ = self._make_loop()
+        ctx = TurnContext(msg=InboundMessage(content="hi", chat_id="test"), session_key="test")
+        await loop._state_restore(ctx)
+        ctx.session.add_message("user", "previous message")
+        await loop._state_compact(ctx)
+        event = await loop._state_build(ctx)
+        self.assertEqual(event, "ok")
+        self.assertEqual(len(ctx.history), 1)
+        self.assertEqual(ctx.history[0]["content"], "previous message")
+        self.assertGreater(len(ctx.initial_messages), 1)
+        self.assertEqual(ctx.initial_messages[-1]["role"], "user")
+        self.assertEqual(ctx.initial_messages[-1]["content"], "hi")
+
+    async def test_state_run(self):
+        loop, _ = self._make_loop()
+        session = Session(key="test")
+        ctx = TurnContext(msg=InboundMessage(content="hello", chat_id="test"), session_key="test")
+        ctx.session = session
+        ctx.summary = "Summary: test"
+        ctx.history = []
+        ctx.initial_messages = loop.context.build_messages(
+            current_message="hello", identity="You are a test bot.", session_summary="Summary: test",
+        )
+        event = await loop._state_run(ctx)
+        self.assertEqual(event, "ok")
+        self.assertIsNotNone(ctx.result)
+        self.assertIn("Summary", ctx.result.final_content)
+
+    async def test_state_save(self):
+        loop, _ = self._make_loop()
+        session = Session(key="test")
+        ctx = TurnContext(msg=InboundMessage(content="hello", chat_id="test"), session_key="test")
+        ctx.session = session
+        ctx.summary = "Summary: test"
+        ctx.history = []
+        ctx.initial_messages = loop.context.build_messages(
+            current_message="hello", identity="You are a test bot.", session_summary="Summary: test",
+        )
+        await loop._state_run(ctx)
+        event = await loop._state_save(ctx)
+        self.assertEqual(event, "ok")
+        self.assertGreater(len(session.messages), 0)
+        self.assertEqual(session.messages[-1]["role"], "assistant")
+
+    async def test_state_respond(self):
+        loop, _ = self._make_loop()
+        session = Session(key="test")
+        ctx = TurnContext(msg=InboundMessage(content="hello", chat_id="test"), session_key="test")
+        ctx.session = session
+        ctx.summary = "Summary: test"
+        ctx.history = []
+        ctx.initial_messages = loop.context.build_messages(
+            current_message="hello", identity="You are a test bot.", session_summary="Summary: test",
+        )
+        await loop._state_run(ctx)
+        await loop._state_save(ctx)
+        event = await loop._state_respond(ctx)
+        self.assertEqual(event, "ok")
+        self.assertIsNotNone(ctx.outbound)
+        self.assertIn("Summary", ctx.outbound.content)
+
+    async def test_state_transitions(self):
+        loop, _ = self._make_loop()
+        ctx = TurnContext(msg=InboundMessage(content="hi", chat_id="trans"), session_key="trans")
+        for expected_state in [TurnState.COMPACT, TurnState.BUILD, TurnState.RUN,
+                                TurnState.SAVE, TurnState.RESPOND, TurnState.DONE]:
+            handler = getattr(loop, f"_state_{ctx.state.name.lower()}")
+            event = await handler(ctx)
+            ctx.state = loop._TRANSITIONS[(ctx.state, event)]
+            self.assertEqual(ctx.state, expected_state)
+
+    async def test_error_in_state_caught_by_process_message(self):
+        loop, _ = self._make_loop()
+
+        class _CrashingProvider:
+            @property
+            def model(self):
+                raise RuntimeError("provider error")
+
+        loop.provider = _CrashingProvider()
+        result = await loop._process_message(
+            InboundMessage(content="hi", chat_id="crash"), "crash",
+        )
+        self.assertIsNotNone(result)
+        self.assertIn("Error", result.content)
+        self.assertEqual(result.metadata.get("stop_reason"), "error")
+
+
+class TestAgentLoopIntegration(unittest.IsolatedAsyncioTestCase):
+    def _make_loop(self):
+        bus = MessageBus()
+        provider = _MockProvider()
+        registry = _MockToolRegistry()
+        tmp = tempfile.mkdtemp()
+        session_manager = SessionManager(workspace=tmp)
+        context_builder = ContextBuilder(workspace=".")
+        memory = MemoryStore(workspace=tmp)
+        loop = AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=session_manager, context_builder=context_builder,
+            memory=memory, identity="You are a test bot.",
+            replay_budget=10000,
+        )
+        return loop, bus
+
+    async def test_full_turn(self):
+        loop, bus = self._make_loop()
+        task = asyncio.create_task(loop.run())
+        await bus.publish_inbound(InboundMessage(content="hello", chat_id="test"))
+        response = await bus.consume_outbound()
+        self.assertIsNotNone(response.content)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_per_session_lock(self):
+        loop, bus = self._make_loop()
+        task = asyncio.create_task(loop.run())
+
+        # Publish both messages; the second should queue behind the first's lock
+        await bus.publish_inbound(InboundMessage(content="msg1", chat_id="lock_test"))
+        await bus.publish_inbound(InboundMessage(content="msg2", chat_id="lock_test"))
+
+        results = []
+        results.append((await _consume_final_response(bus)).content)
+        results.append((await _consume_final_response(bus)).content)
+
+        self.assertEqual(len(results), 2)
+        session = loop.sessions.get_or_create("lock_test")
+        self.assertEqual(len(session.messages), 4)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_cross_session_concurrent(self):
+        loop, bus = self._make_loop()
+        task = asyncio.create_task(loop.run())
+
+        async def send_and_collect(key, text):
+            await bus.publish_inbound(InboundMessage(content=text, chat_id=key))
+            return await bus.consume_outbound()
+
+        t1 = asyncio.create_task(send_and_collect("sess_a", "hello a"))
+        t2 = asyncio.create_task(send_and_collect("sess_b", "hello b"))
+        r1, r2 = await asyncio.gather(t1, t2)
+        self.assertIsNotNone(r1.content)
+        self.assertIsNotNone(r2.content)
+        sess_a = loop.sessions.get_or_create("sess_a")
+        sess_b = loop.sessions.get_or_create("sess_b")
+        self.assertEqual(len(sess_a.messages), 2)
+        self.assertEqual(len(sess_b.messages), 2)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_loop_stop_exits(self):
+        loop, bus = self._make_loop()
+        task = asyncio.create_task(loop.run())
+        await asyncio.sleep(0.05)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+# ���� Existing MessageBus Tests ����
+
+class TestMessageBus(unittest.IsolatedAsyncioTestCase):
+    async def test_publish_consume_inbound(self):
+        bus = MessageBus()
+        msg = InboundMessage(content="hello")
+        await bus.publish_inbound(msg)
+        received = await bus.consume_inbound()
+        self.assertEqual(received.content, "hello")
+
+    async def test_publish_consume_outbound(self):
+        bus = MessageBus()
+        msg = OutboundMessage(content="world")
+        await bus.publish_outbound(msg)
+        received = await bus.consume_outbound()
+        self.assertEqual(received.content, "world")
+
+    async def test_multiple_messages_fifo(self):
+        bus = MessageBus()
+        for i in range(5):
+            await bus.publish_inbound(InboundMessage(content=str(i)))
+        for i in range(5):
+            received = await bus.consume_inbound()
+            self.assertEqual(received.content, str(i))
+
+    async def test_inbound_size(self):
+        bus = MessageBus()
+        self.assertEqual(bus.inbound_size, 0)
+        await bus.publish_inbound(InboundMessage(content="a"))
+        self.assertEqual(bus.inbound_size, 1)
+
+    async def test_concurrent_producer_consumer(self):
+        bus = MessageBus()
+        N = 100
+
+        async def produce():
+            for i in range(N):
+                await bus.publish_inbound(InboundMessage(content=str(i)))
+
+        async def consume():
+            results = []
+            for _ in range(N):
+                msg = await bus.consume_inbound()
+                results.append(int(msg.content))
+            return results
+
+        producer = asyncio.create_task(produce())
+        consumer = asyncio.create_task(consume())
+        await producer
+        results = await consumer
+        self.assertEqual(len(results), N)
+        self.assertEqual(results, list(range(N)))
+
+
+# ���� Existing Token Estimator Tests ����
+
+class TestTokenEstimator(unittest.TestCase):
+    def test_text_message(self):
+        tokens = estimate_message_tokens({"role": "user", "content": "hello"})
+        self.assertGreaterEqual(tokens, 4)
+
+    def test_long_text(self):
+        tokens = estimate_message_tokens({"role": "user", "content": "a" * 100})
+        self.assertGreaterEqual(tokens, 25)
+
+    def test_with_tool_calls(self):
+        msg = {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "echo", "arguments": '{"text":"hi"}'}}],
+        }
+        tokens = estimate_message_tokens(msg)
+        self.assertGreater(tokens, 10)
+
+    def test_estimate_prompt_tokens(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        total = estimate_prompt_tokens(msgs)
+        self.assertGreaterEqual(total, 8)
+
+
+class TestGetHistoryMaxTokens(unittest.TestCase):
+    def test_max_tokens_limits_history(self):
+        session = Session(key="test")
+        for i in range(20):
+            session.add_message("user", f"message {i}")
+        history = session.get_history(max_messages=50, max_tokens=50)
+        self.assertLess(len(history), 20)
+
+    def test_max_tokens_returns_all_if_under_budget(self):
+        session = Session(key="test")
+        session.add_message("user", "hi")
+        history = session.get_history(max_messages=50, max_tokens=10000)
+        self.assertEqual(len(history), 1)
+
+    def test_max_tokens_zero_behavior(self):
+        session = Session(key="test")
+        for i in range(5):
+            session.add_message("user", str(i))
+        history = session.get_history(max_messages=50, max_tokens=0)
+        self.assertEqual(len(history), 5)
+
+
+class TestConsolidatorFindBoundary(unittest.TestCase):
+    def test_boundary_under_target(self):
+        msgs = [{"role": "user", "content": f"msg{i}"} for i in range(10)]
+        boundary = _consolidation_boundary(msgs, 10000)
+        self.assertEqual(boundary, 0)
+
+    def test_boundary_truncates(self):
+        msgs = [{"role": "user", "content": "x" * 200} for _ in range(20)]
+        boundary = _consolidation_boundary(msgs, 100)
+        self.assertGreater(boundary, 0)
+        self.assertLess(boundary, 20)
+
+
+class TestConsolidatorMaybeConsolidate(unittest.IsolatedAsyncioTestCase):
+    async def test_noop_when_under_budget(self):
+        session = Session(key="test")
+        session.add_message("user", "hi")
+        conso = Consolidator(store=MemoryStore(workspace=tempfile.mkdtemp()), sessions=SessionManager(workspace=tempfile.mkdtemp()), build_messages=lambda **kw: [], get_tool_definitions=lambda: [])
+        summary = await conso.maybe_consolidate(session, max_tokens=10000)
+        self.assertIsNone(summary)
+
+    async def test_truncate_without_provider(self):
+        session = Session(key="test")
+        for i in range(20):
+            session.add_message("user", "x" * 200 + str(i))
+        conso = Consolidator(store=MemoryStore(workspace=tempfile.mkdtemp()), sessions=SessionManager(workspace=tempfile.mkdtemp()), build_messages=lambda **kw: [], get_tool_definitions=lambda: [])
+        summary = await conso.maybe_consolidate(session, max_tokens=100)
+        self.assertIsNone(summary)
+        self.assertGreater(session.last_consolidated, 0)
+
+    async def test_with_provider_returns_summary(self):
+        session = Session(key="test")
+        for i in range(20):
+            session.add_message("user", "x" * 200 + str(i))
+        conso = Consolidator(store=MemoryStore(workspace=tempfile.mkdtemp()), sessions=SessionManager(workspace=tempfile.mkdtemp()), build_messages=lambda **kw: [], get_tool_definitions=lambda: [])
+        conso.provider = _MockProvider()
+        summary = await conso.maybe_consolidate(session, max_tokens=100)
+        self.assertIsNotNone(summary)
+        self.assertIn("Summary", summary)
+
+    async def test_no_unconsolidated_messages(self):
+        session = Session(key="test")
+        session.last_consolidated = 0
+        conso = Consolidator(store=MemoryStore(workspace=tempfile.mkdtemp()), sessions=SessionManager(workspace=tempfile.mkdtemp()), build_messages=lambda **kw: [], get_tool_definitions=lambda: [])
+        result = await conso.maybe_consolidate(session, max_tokens=100)
+        self.assertIsNone(result)
+
+
+class TestFormatMessages(unittest.TestCase):
+    def test_format_simple(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        formatted = MemoryStore._format_messages(msgs)
+        self.assertIn("[user]", formatted)
+        self.assertIn("[assistant]", formatted)
+
+
+class TestContextBuilderWithSummary(unittest.TestCase):
+    def test_session_summary_in_system_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = ContextBuilder(workspace=tmp)
+            prompt = ctx.build_system_prompt(session_summary="User likes Python.")
+        self.assertIn("Archived Context Summary", prompt)
+
+    def test_no_summary_when_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = ContextBuilder(workspace=tmp)
+            prompt = ctx.build_system_prompt()
+        self.assertNotIn("Archived Context Summary", prompt)
+
+
+# ���� Mid-turn Injection Tests ����
+
+class _InjectionSource:
+    """Helper that returns injected messages a limited number of times."""
+    def __init__(self, messages: list[str]):
+        self._messages = list(messages)
+        self.calls = 0
+
+    async def callback(self) -> list[dict]:
+        self.calls += 1
+        if self.calls <= len(self._messages):
+            return [{"role": "user", "content": self._messages[self.calls - 1]}]
+        return []
+
+
+class _SingleResponseProvider(LLMProvider):
+    @property
+    def model(self):
+        return "mock"
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        return LLMResponse(content="Here is my response.", finish_reason="stop", usage={"prompt_tokens": 10, "completion_tokens": 5})
+    async def chat_stream_with_retry(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096, on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            for chunk in resp.content.split(" "):
+                await on_content_delta(chunk + " ")
+        return resp
+
+
+class _MultiResponseProvider(LLMProvider):
+    """Returns pre-configured responses in sequence."""
+    def __init__(self, responses: list[LLMResponse]):
+        self._responses = list(responses)
+        self.call_count = 0
+    @property
+    def model(self):
+        return "mock"
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        idx = self.call_count
+        self.call_count += 1
+        if idx < len(self._responses):
+            return self._responses[idx]
+        return LLMResponse(content="Final fallback.", finish_reason="stop", usage={"prompt_tokens": 5, "completion_tokens": 3})
+    async def chat_stream_with_retry(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096, on_content_delta=None, retry_config=None):
+        response = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and response.content:
+            for chunk in response.content.split(" "):
+                await on_content_delta(chunk + " ")
+        return response
+
+
+def _make_injection_loop(provider=None):
+    bus = MessageBus()
+    p = provider or _MockProvider()
+    registry = _MockToolRegistry()
+    tmp = tempfile.mkdtemp()
+    session_manager = SessionManager(workspace=tmp)
+    context_builder = ContextBuilder(workspace=".")
+    memory = MemoryStore(workspace=tmp)
+    loop = AgentLoop(
+        bus=bus, provider=p, registry=registry,
+        session_manager=session_manager, context_builder=context_builder,
+        memory=memory, identity="You are a test bot.",
+        replay_budget=10000,
+    )
+    return loop, bus
+
+
+class TestMidTurnInjection(unittest.IsolatedAsyncioTestCase):
+    async def test_injection_callback_returns_messages(self):
+        """injection_callback drains queued messages and returns message dicts."""
+        queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        await queue.put(InboundMessage(content="injected1"))
+        await queue.put(InboundMessage(content="injected2"))
+
+        async def injection_callback():
+            msgs = []
+            while not queue.empty():
+                try:
+                    m = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                msgs.append({"role": "user", "content": m.content})
+            return msgs
+
+        result = await injection_callback()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["role"], "user")
+        self.assertEqual(result[0]["content"], "injected1")
+        self.assertEqual(result[1]["content"], "injected2")
+
+    async def test_runner_injection_after_tool_execution(self):
+        """Runner drains injected messages after tool execution."""
+        injector = _InjectionSource(["stop and respond"])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "do something"}],
+            tools=_EchoToolRegistryForStream(),
+            provider=_StreamingToolCallProvider(),
+            injection_callback=injector.callback,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.final_content)
+        msg_contents = [m.get("content", "") for m in result.messages]
+        found = any("stop and respond" in str(c) for c in msg_contents)
+        self.assertTrue(found, "Injected message should appear in conversation")
+
+    async def test_runner_injection_before_final_response(self):
+        """Runner drains injected messages before final text response and extends turn."""
+        injector = _InjectionSource(["wait, one more thing"])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_SingleResponseProvider(),
+            injection_callback=injector.callback,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.final_content)
+        user_msgs = [m for m in result.messages if m["role"] == "user"]
+        user_contents = [m["content"] for m in user_msgs]
+        self.assertIn("wait, one more thing", user_contents)
+
+    async def test_runner_injection_extends_turn(self):
+        """Injected messages lead to additional LLM iterations."""
+        call_count = 0
+        async def injection_callback():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [{"role": "user", "content": "extend me"}]
+            return []
+
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "first msg"}],
+            tools=_MockToolRegistry(),
+            provider=_MultiResponseProvider([
+                LLMResponse(content="First response.", finish_reason="stop", usage={"prompt_tokens": 10, "completion_tokens": 5}),
+                LLMResponse(content="Second after injection.", finish_reason="stop", usage={"prompt_tokens": 15, "completion_tokens": 8}),
+            ]),
+            injection_callback=injection_callback,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stop_reason, "stop")
+        self.assertEqual(result.final_content, "Second after injection.")
+
+    async def test_empty_injection_callback_noop(self):
+        """Empty injection_callback returns [] and doesn't affect flow."""
+        async def empty_callback():
+            return []
+
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            injection_callback=empty_callback,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIn("Summary", result.final_content)
+
+    async def test_injection_preserves_assistant_message(self):
+        """Assistant message is preserved when injection extends turn."""
+        call_count = 0
+        async def injection_callback():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [{"role": "user", "content": "tell me more"}]
+            return []
+
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=_MultiResponseProvider([
+                LLMResponse(content="First answer.", finish_reason="stop", usage={"prompt_tokens": 10, "completion_tokens": 5}),
+                LLMResponse(content="Second answer.", finish_reason="stop", usage={"prompt_tokens": 15, "completion_tokens": 8}),
+            ]),
+            injection_callback=injection_callback,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        assistant_msgs = [m for m in result.messages if m["role"] == "assistant"]
+        self.assertGreaterEqual(len(assistant_msgs), 2)
+        self.assertIn("First answer.", assistant_msgs[0]["content"])
+
+    async def test_no_injection_callback_works(self):
+        """Runner works normally without injection_callback."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIn("Summary", result.final_content)
+
+    async def test_injection_callback_single_call_multiple_messages(self):
+        """Multiple queued messages are drained in a single callback call."""
+        queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        for i in range(5):
+            await queue.put(InboundMessage(content=f"msg{i}"))
+
+        async def drain_all():
+            msgs = []
+            while not queue.empty():
+                try:
+                    m = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                msgs.append({"role": "user", "content": m.content})
+            return msgs
+
+        injected = await drain_all()
+        self.assertEqual(len(injected), 5)
+        self.assertEqual(injected[0]["content"], "msg0")
+        self.assertEqual(injected[4]["content"], "msg4")
+
+    async def test_loop_get_or_create_queue(self):
+        """_get_or_create_queue creates and caches per-session queues."""
+        loop, _ = _make_injection_loop()
+        q1 = loop._get_or_create_queue("sess_a")
+        q2 = loop._get_or_create_queue("sess_a")
+        q3 = loop._get_or_create_queue("sess_b")
+        self.assertIs(q1, q2)
+        self.assertIsNot(q1, q3)
+        self.assertEqual(q1.maxsize, 20)
+
+    async def test_loop_state_run_creates_injection_callback(self):
+        """_state_run creates an injection_callback tied to the session key."""
+        loop, _ = _make_injection_loop()
+        # Manually put a message in the pending queue
+        loop._pending_queues["inj_test"] = asyncio.Queue()
+        loop._pending_queues["inj_test"].put_nowait(InboundMessage(content="queued"))
+        session = Session(key="inj_test")
+        ctx = TurnContext(msg=InboundMessage(content="hello", chat_id="inj_test"), session_key="inj_test")
+        ctx.session = session
+        ctx.summary = "Summary: test"
+        ctx.history = []
+        ctx.initial_messages = loop.context.build_messages(
+            current_message="hello", identity="You are a test bot.", session_summary="Summary: test",
+        )
+        event = await loop._state_run(ctx)
+        self.assertEqual(event, "ok")
+        self.assertIsNotNone(ctx.result)
+
+    async def test_leftover_drain_republishes_to_bus(self):
+        """AgentLoop._drain_leftover republishes queued messages to bus.inbound."""
+        loop, bus = _make_injection_loop()
+        loop._pending_queues["test"] = asyncio.Queue()
+        loop._pending_queues["test"].put_nowait(InboundMessage(content="leftover_msg", chat_id="test"))
+        await loop._drain_leftover("test")
+        msg = await bus.consume_inbound()
+        self.assertEqual(msg.content, "leftover_msg")
+        # Queue should now be empty
+        self.assertTrue(loop._pending_queues["test"].empty())
+
+    async def test_leftover_drain_empty_noop(self):
+        """_drain_leftover with empty queue does nothing."""
+        loop, bus = _make_injection_loop()
+        loop._pending_queues["test_empty"] = asyncio.Queue()
+        await loop._drain_leftover("test_empty")
+        self.assertEqual(bus.inbound_size, 0)
+
+
+# ���� Context Governance Tests ����
+
+_GOVERNOR = ContextGovernor()
+_MOCK_TOOLS = _MockToolRegistry()
+
+
+def _gov_config(
+    context_window_tokens: int | None = 200_000,
+    max_tool_result_chars: int = 16_000,
+    max_tokens: int = 4096,
+    context_block_limit: int | None = None,
+) -> ContextGovernanceConfig:
+    return ContextGovernanceConfig(
+        tools=_MOCK_TOOLS,
+        context_window_tokens=context_window_tokens,
+        max_tool_result_chars=max_tool_result_chars,
+        max_tokens=max_tokens,
+        context_block_limit=context_block_limit,
+    )
+
+
+class TestGovernanceInputBudget(unittest.TestCase):
+    def test_budget_with_context_window(self):
+        config = _gov_config(context_window_tokens=200_000, max_tokens=8192)
+        budget = ContextGovernor.input_budget(config)
+        expected = 200_000 - 8192 - 1024
+        self.assertEqual(budget, expected)
+
+    def test_budget_no_context_window(self):
+        config = _gov_config(context_window_tokens=None)
+        budget = ContextGovernor.input_budget(config)
+        self.assertEqual(budget, 0)
+
+    def test_budget_with_block_limit(self):
+        config = _gov_config(context_window_tokens=200_000, context_block_limit=50_000)
+        budget = ContextGovernor.input_budget(config)
+        self.assertEqual(budget, 50_000)
+
+    def test_budget_clamps_to_zero(self):
+        config = _gov_config(context_window_tokens=500, max_tokens=4096)
+        budget = ContextGovernor.input_budget(config)
+        self.assertEqual(budget, 0)
+
+
+class TestGovernanceStripPlaceholder(unittest.TestCase):
+    def test_removes_placeholder(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "[Previous assistant message omitted.]"},
+            {"role": "user", "content": "next"},
+        ]
+        result = _GOVERNOR.strip_placeholder_assistant_messages(msgs)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[1]["content"], "next")
+
+    def test_preserves_placeholder_with_tool_calls(self):
+        msgs = [
+            {"role": "assistant", "content": "[Previous assistant message omitted.]",
+             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}}]},
+        ]
+        result = _GOVERNOR.strip_placeholder_assistant_messages(msgs)
+        self.assertEqual(len(result), 1)
+
+    def test_no_placeholder_no_change(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        result = _GOVERNOR.strip_placeholder_assistant_messages(msgs)
+        self.assertIs(result, msgs)
+
+
+class TestGovernanceStripMalformed(unittest.TestCase):
+    def test_strips_malformed_name_none(self):
+        msgs = [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": None, "arguments": "{}"}}]},
+        ]
+        result = _GOVERNOR.strip_malformed_tool_calls(msgs)
+        self.assertEqual(len(result), 0)
+
+    def test_keeps_valid_tool_call(self):
+        msgs = [
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}}]},
+        ]
+        result = _GOVERNOR.strip_malformed_tool_calls(msgs)
+        self.assertEqual(len(result), 1)
+
+    def test_keeps_mixed_removes_bad(self):
+        msgs = [
+            {"role": "assistant", "content": "",
+             "tool_calls": [
+                 {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+                 {"id": "c2", "type": "function", "function": {"name": None, "arguments": "{}"}},
+             ]},
+        ]
+        result = _GOVERNOR.strip_malformed_tool_calls(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]["tool_calls"]), 1)
+        self.assertEqual(result[0]["tool_calls"][0]["id"], "c1")
+
+
+class TestGovernanceDropOrphan(unittest.TestCase):
+    def test_drops_orphan_tool_result(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "orphan_id", "content": "result"},
+        ]
+        result = _GOVERNOR.drop_orphan_tool_results(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "user")
+
+    def test_keeps_matched_tool_result(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]
+        result = _GOVERNOR.drop_orphan_tool_results(msgs)
+        self.assertEqual(len(result), 2)
+
+    def test_full_chain_preserved(self):
+        msgs = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+        ]
+        result = _GOVERNOR.drop_orphan_tool_results(msgs)
+        self.assertEqual(len(result), 4)
+
+
+class TestGovernanceBackfill(unittest.TestCase):
+    def test_backfills_missing(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+        ]
+        result = _GOVERNOR.backfill_missing_tool_results(msgs)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[1]["role"], "tool")
+        self.assertEqual(result[1]["tool_call_id"], "c1")
+        self.assertIn("unavailable", result[1]["content"])
+
+    def test_no_backfill_when_present(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]
+        result = _GOVERNOR.backfill_missing_tool_results(msgs)
+        self.assertIs(result, msgs)
+
+    def test_backfills_multiple_missing(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+        ]
+        result = _GOVERNOR.backfill_missing_tool_results(msgs)
+        self.assertEqual(len(result), 3)
+        tool_msgs = [m for m in result if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        self.assertEqual(tool_msgs[0]["tool_call_id"], "c1")
+        self.assertEqual(tool_msgs[1]["tool_call_id"], "c2")
+
+
+class TestGovernanceApplyBudget(unittest.TestCase):
+    def test_truncates_oversized_result(self):
+        config = _gov_config(max_tool_result_chars=50)
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c1", "name": "echo", "content": "x" * 200},
+        ]
+        result = _GOVERNOR.apply_tool_result_budget(config, msgs)
+        tool_content = result[1]["content"]
+        self.assertLess(len(tool_content), 200)
+        self.assertIn("truncated", tool_content)
+
+    def test_keeps_normal_sized_result(self):
+        config = _gov_config(max_tool_result_chars=16_000)
+        msgs = [
+            {"role": "tool", "tool_call_id": "c1", "name": "echo", "content": "short result"},
+        ]
+        result = _GOVERNOR.apply_tool_result_budget(config, msgs)
+        self.assertEqual(result[0]["content"], "short result")
+
+
+class TestGovernanceNormalizeToolResult(unittest.TestCase):
+    def test_empty_result_replaced(self):
+        result = ContextGovernor.normalize_tool_result(
+            _gov_config(), "c1", "echo", None,
+        )
+        self.assertIn("completed with no output", result)
+
+    def test_oversized_truncated(self):
+        result = ContextGovernor.normalize_tool_result(
+            _gov_config(max_tool_result_chars=20), "c1", "echo", "x" * 100,
+        )
+        self.assertLess(len(result), 100)
+        self.assertIn("truncated", result)
+
+    def test_exempt_tool_unchanged(self):
+        result = ContextGovernor.normalize_tool_result(
+            _gov_config(max_tool_result_chars=20), "c1", "read_file", "x" * 100,
+        )
+        self.assertEqual(result, "x" * 100)
+
+
+class TestGovernanceCompactOverflow(unittest.TestCase):
+    def test_no_compact_when_under_budget(self):
+        config = _gov_config(context_window_tokens=200_000, max_tokens=4096)
+        msgs = [
+            {"role": "user", "content": "hi"},
+        ]
+        compacted_ids: set[str] = set()
+        result = _GOVERNOR.compact_inflight_overflow(config, msgs, compacted_ids)
+        self.assertIs(result, msgs)
+
+    def test_compact_when_over_budget(self):
+        class _SmallBudgetTools:
+            def get_definitions(self):
+                return []
+        config = ContextGovernanceConfig(
+            tools=_SmallBudgetTools(),
+            context_window_tokens=2000,
+            max_tokens=500,
+        )
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "x" * 2000},
+        ]
+        compacted_ids: set[str] = set()
+        result = _GOVERNOR.compact_inflight_overflow(config, msgs, compacted_ids)
+        self.assertIn("compacted", result[2]["content"])
+
+
+class TestGovernanceSnipHistory(unittest.TestCase):
+    def test_no_snip_when_under_budget(self):
+        config = _gov_config(context_window_tokens=200_000, max_tokens=4096)
+        msgs = [{"role": "user", "content": "hi"}]
+        result = _GOVERNOR.snip_history(config, msgs)
+        self.assertIs(result, msgs)
+
+    def test_snip_when_over_budget(self):
+        config = _gov_config(context_window_tokens=2000, max_tokens=500)
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+        ] + [
+            {"role": "user", "content": "x" * 100}
+        ] * 20
+        result = _GOVERNOR.snip_history(config, msgs)
+        self.assertLess(len(result), len(msgs))
+        self.assertEqual(result[0]["role"], "system")
+
+
+class TestGovernancePipeline(unittest.TestCase):
+    def test_prepare_for_model_full_pipeline(self):
+        config = _gov_config(context_window_tokens=200_000, max_tool_result_chars=50)
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "[Previous assistant message omitted.]"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "echo", "content": "ok"},
+        ]
+        compacted_ids: set[str] = set()
+        result = _GOVERNOR.prepare_for_model(config, msgs, compacted_ids)
+        self.assertIsNot(result, msgs)
+        self.assertLessEqual(len(result), len(msgs))
+
+
+class _GovProvider(LLMProvider):
+    @property
+    def model(self):
+        return "mock"
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        return LLMResponse(content="ok", finish_reason="stop", usage={"prompt_tokens": 5, "completion_tokens": 3})
+    async def chat_stream_with_retry(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096, on_content_delta=None, retry_config=None):
+        if on_content_delta:
+            await on_content_delta("ok")
+        return await self.chat(messages, tools, model, temperature, max_tokens)
+
+
+class TestGovernanceRunnerIntegration(unittest.IsolatedAsyncioTestCase):
+    async def test_governance_applies_to_messages(self):
+        config = ContextGovernanceConfig(
+            tools=_MockToolRegistry(),
+            context_window_tokens=200_000,
+        )
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_GovProvider(),
+            governance_config=config,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.final_content, "ok")
+
+    async def test_governance_none_no_impact(self):
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=_MockToolRegistry(),
+            provider=_GovProvider(),
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.final_content, "ok")
+
+    async def test_governance_in_multi_iteration(self):
+        class _TwoCallProvider(LLMProvider):
+            @property
+            def model(self):
+                return "mock"
+            async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+                is_first = True
+                for m in reversed(messages):
+                    if m.get("role") == "user":
+                        is_first = True
+                        break
+                    elif m.get("role") == "tool":
+                        is_first = False
+                        break
+                if is_first:
+                    return LLMResponse(content="", tool_calls=[
+                        ToolCallRequest(id="c1", name="echo", arguments={"text": "hello"}),
+                    ], finish_reason="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 5})
+                return LLMResponse(content="done", finish_reason="stop", usage={"prompt_tokens": 15, "completion_tokens": 8})
+            async def chat_stream_with_retry(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096, on_content_delta=None, retry_config=None):
+                resp = await self.chat(messages, tools, model, temperature, max_tokens)
+                if on_content_delta and resp.content:
+                    await on_content_delta(resp.content)
+                return resp
+
+        config = ContextGovernanceConfig(
+            tools=_MockToolRegistry(),
+            context_window_tokens=200_000,
+        )
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "do it"}],
+            tools=_EchoToolRegistryForStream(),
+            provider=_TwoCallProvider(),
+            governance_config=config,
+            max_iterations=3,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIn("done", result.final_content)
+
+
+class TestGovernanceHelpers(unittest.TestCase):
+    def test_estimate_message_tokens(self):
+        from step20.helpers import estimate_message_tokens as emt
+        tokens = emt({"role": "user", "content": "hello"})
+        self.assertGreaterEqual(tokens, 4)
+
+    def test_estimate_prompt_tokens_with_tools(self):
+        from step20.helpers import estimate_prompt_tokens
+        tokens = estimate_prompt_tokens(
+            [{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+        )
+        self.assertGreater(tokens, 0)
+
+    def test_find_legal_message_start(self):
+        from step20.helpers import find_legal_message_start
+        msgs = [
+            {"role": "tool", "tool_call_id": "orphan", "content": "x"},
+            {"role": "user", "content": "hi"},
+        ]
+        start = find_legal_message_start(msgs)
+        self.assertEqual(start, 1)
+
+    def test_truncate_text(self):
+        from step20.helpers import truncate_text
+        result = truncate_text("hello world", 5)
+        self.assertIn("truncated", result)
+        self.assertLessEqual(len(result), 20)
+
+    def test_ensure_nonempty_tool_result(self):
+        from step20.helpers import ensure_nonempty_tool_result
+        result = ensure_nonempty_tool_result("echo", None)
+        self.assertIn("completed with no output", result)
+        # non-empty passes through
+        self.assertEqual(ensure_nonempty_tool_result("echo", "ok"), "ok")
+
+
+class TestMemoryStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = MemoryStore(workspace=self.tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_append_and_read(self):
+        c1 = self.store.append_history("first entry", session_key="test")
+        c2 = self.store.append_history("second entry", session_key="test")
+        self.assertIsInstance(c1, int)
+        self.assertIsInstance(c2, int)
+        self.assertGreater(c2, c1)
+        entries = self.store.read_unprocessed_history(since_cursor=0)
+        self.assertEqual(len(entries), 2)
+
+    def test_read_unprocessed_since_cursor(self):
+        c1 = self.store.append_history("entry A")
+        self.store.append_history("entry B")
+        entries = self.store.read_unprocessed_history(since_cursor=c1)
+        self.assertEqual(len(entries), 1)
+
+    def test_raw_archive(self):
+        msgs = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]
+        cursor = self.store.raw_archive(msgs, session_key="test")
+        self.assertGreater(cursor, 0)
+        entries = self.store.read_unprocessed_history(since_cursor=0)
+        content = entries[0]["content"]
+        self.assertIn("[RAW]", content)
+
+    def test_compact_history_preserves_recent(self):
+        for i in range(50):
+            self.store.append_history(f"entry {i}")
+        # max_history_entries defaults to 1000, so test with smaller
+        store_small = MemoryStore(workspace=tempfile.mkdtemp(), max_history_entries=10)
+        for i in range(50):
+            store_small.append_history(f"entry {i}")
+        store_small.compact_history()
+        entries = store_small._read_entries()
+        self.assertLessEqual(len(entries), 10)
+
+    def test_cursor_persistence(self):
+        c1 = self.store.append_history("test")
+        c2 = self.store.get_latest_cursor()
+        self.assertEqual(c1, c2)
+
+    def test_dream_cursor(self):
+        self.assertEqual(self.store.get_last_dream_cursor(), 0)
+        self.store.set_last_dream_cursor(42)
+        self.assertEqual(self.store.get_last_dream_cursor(), 42)
+
+    def test_get_latest_cursor_empty(self):
+        self.assertEqual(self.store.get_latest_cursor(), 0)
+
+
+class TestDream(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = MemoryStore(workspace=self.tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_build_dream_prompt_no_entries(self):
+        result = self.store.build_dream_prompt(max_entries=20)
+        self.assertIsNone(result)
+
+    async def test_build_dream_prompt_with_entries(self):
+        self.store.append_history("user mentioned they like python")
+        self.store.append_history("assistant suggested learning pytest")
+        result = self.store.build_dream_prompt(max_entries=20)
+        self.assertIsNotNone(result)
+        prompt, cursor = result
+        self.assertIn("Conversation History", prompt)
+        self.assertIn("python", prompt)
+
+    async def test_build_dream_prompt_respects_cursor(self):
+        self.store.append_history("entry before")
+        self.store.set_last_dream_cursor(1)
+        self.store.append_history("entry after")
+        result = self.store.build_dream_prompt(max_entries=20)
+        self.assertIsNotNone(result)
+        prompt, cursor = result
+        self.assertNotIn("entry before", prompt)
+        self.assertIn("entry after", prompt)
+
+    async def test_build_dream_prompt_truncates_long_content(self):
+        long_text = "x" * 2000
+        self.store.append_history(long_text)
+        result = self.store.build_dream_prompt(max_entries=20)
+        self.assertIsNotNone(result)
+        prompt, cursor = result
+        # content should be truncated to 500 chars per entry
+        self.assertNotIn("x" * 501, prompt)
+
+
+class TestConsolidatorNewAPI(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = MemoryStore(workspace=self.tmp)
+        self.sessions = SessionManager(workspace=self.tmp)
+        self.registry = _MockToolRegistry()
+        self.conso = Consolidator(
+            store=self.store,
+            sessions=self.sessions,
+            build_messages=lambda **kw: [],
+            get_tool_definitions=self.registry.get_definitions,
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_maybe_consolidate_by_tokens_noop_empty_session(self):
+        session = self.sessions.get_or_create("empty")
+        runtime = Runtime(context_window_tokens=10000, max_tokens=1024)
+        await self.conso.maybe_consolidate_by_tokens(session, runtime=runtime)
+        self.assertEqual(session.last_consolidated, 0)
+
+    async def test_maybe_consolidate_by_tokens_noop_under_budget(self):
+        session = self.sessions.get_or_create("small")
+        session.add_message("user", "hi")
+        runtime = Runtime(context_window_tokens=10000, max_tokens=1024)
+        await self.conso.maybe_consolidate_by_tokens(session, runtime=runtime)
+        self.assertEqual(session.last_consolidated, 0)
+
+    async def test_maybe_consolidate_by_tokens_no_runtime(self):
+        session = self.sessions.get_or_create("test")
+        session.add_message("user", "hello")
+        await self.conso.maybe_consolidate_by_tokens(session, runtime=None)
+        self.assertEqual(session.last_consolidated, 0)
+
+    async def test_maybe_consolidate_by_tokens_triggers(self):
+        session = self.sessions.get_or_create("big")
+        for i in range(30):
+            session.add_message("user", "x" * 500 + str(i))
+        runtime = Runtime(context_window_tokens=2000, max_tokens=128)
+        await self.conso.maybe_consolidate_by_tokens(session, runtime=runtime)
+        self.assertGreater(session.last_consolidated, 0)
+        meta = session.metadata.get("_last_summary")
+        # without a provider, summary should be None and last_consolidated still advances
+        self.assertIsNone(meta)
+
+    async def test_maybe_consolidate_with_provider(self):
+        prov = _MockProvider()
+        tmp2 = tempfile.mkdtemp()
+        sessions2 = SessionManager(workspace=tmp2)
+        store2 = MemoryStore(workspace=tmp2)
+        conso = Consolidator(
+            store=store2,
+            sessions=sessions2,
+            build_messages=lambda **kw: [],
+            get_tool_definitions=lambda: [],
+            provider=prov,
+        )
+        session = sessions2.get_or_create("prov")
+        for i in range(20):
+            session.add_message("user", "x" * 500 + str(i))
+        runtime = Runtime(context_window_tokens=2000, max_tokens=128, provider=prov, model="mock")
+        conso.provider = prov
+        await conso.maybe_consolidate_by_tokens(session, runtime=runtime)
+        meta = session.metadata.get("_last_summary")
+        self.assertIsNotNone(meta)
+        self.assertIn("text", meta)
+
+    async def test_compact_idle_session_noop(self):
+        result = await self.conso.compact_idle_session("nonexistent", runtime=Runtime(context_window_tokens=10000, max_tokens=1024))
+        self.assertEqual(result, "")
+
+    async def test_pick_consolidation_boundary(self):
+        session = self.sessions.get_or_create("boundary")
+        for i in range(10):
+            session.add_message("user", "msg " + str(i))
+        boundary = self.conso.pick_consolidation_boundary(session, tokens_to_remove=10000)
+        # best-effort: returns last user boundary even if tokens_to_remove > total
+        self.assertIsNotNone(boundary)
+
+    async def test_pick_consolidation_boundary_some(self):
+        session = self.sessions.get_or_create("bound")
+        for i in range(10):
+            session.add_message("user", "x" * 200 + str(i))
+        self.conso.consolidation_ratio = 0.3
+        boundary = self.conso.pick_consolidation_boundary(session, tokens_to_remove=50)
+        # With 10 msgs of ~50 tokens each = 500 total tokens
+        # tokens_to_remove=50 should return a boundary at the first user msg
+        self.assertIsNotNone(boundary)
+        idx, tokens = boundary
+        self.assertGreaterEqual(idx, 1)
+
+    async def test_archive_without_provider_falls_back(self):
+        msgs = [{"role": "user", "content": "test data"}]
+        runtime = Runtime(context_window_tokens=10000, max_tokens=1024, provider=None)
+        result = await self.conso.archive(msgs, runtime=runtime, session_key="test")
+        self.assertIsNone(result)  # no provider �� returns None after raw_archive
+
+    async def test_archive_with_provider(self):
+        msgs = [{"role": "user", "content": "hello world"}]
+        prov = _MockProvider()
+        runtime = Runtime(context_window_tokens=10000, max_tokens=1024, provider=prov, model="mock")
+        result = await self.conso.archive(msgs, runtime=runtime, session_key="test")
+        self.assertIsNotNone(result)
+        self.assertIn("Summary", result)
+
+    async def test_archive_empty(self):
+        runtime = Runtime(context_window_tokens=10000, max_tokens=1024)
+        result = await self.conso.archive([], runtime=runtime)
+        self.assertIsNone(result)
+
+
+class TestRuntime(unittest.TestCase):
+    def test_defaults(self):
+        r = Runtime(context_window_tokens=4096)
+        self.assertEqual(r.context_window_tokens, 4096)
+        self.assertEqual(r.max_tokens, 4096)
+        self.assertIsNone(r.provider)
+        self.assertIsNone(r.model)
+
+    def test_custom_values(self):
+        r = Runtime(context_window_tokens=8192, max_tokens=1024, provider="test", model="gpt-4")
+        self.assertEqual(r.context_window_tokens, 8192)
+        self.assertEqual(r.max_tokens, 1024)
+        self.assertEqual(r.provider, "test")
+        self.assertEqual(r.model, "gpt-4")
+
+
+# ---- Step 16 Tests: Goal State ----
+
+class TestGoalState(unittest.TestCase):
+    def test_parse_goal_state_none(self):
+        self.assertIsNone(parse_goal_state(None))
+        self.assertIsNone(parse_goal_state("invalid json"))
+
+    def test_parse_goal_state_dict(self):
+        blob = {"status": "active", "objective": "test"}
+        self.assertEqual(parse_goal_state(blob), blob)
+
+    def test_sustained_goal_active(self):
+        meta = {"goal_state": {"status": "active", "objective": "do x"}}
+        self.assertTrue(sustained_goal_active(meta))
+        self.assertFalse(sustained_goal_active({"goal_state": {"status": "completed"}}))
+        self.assertFalse(sustained_goal_active({}))
+        self.assertFalse(sustained_goal_active(None))
+
+    def test_goal_state_runtime_lines_active(self):
+        meta = {"goal_state": {"status": "active", "objective": "implement feature X"}}
+        lines = goal_state_runtime_lines(meta)
+        self.assertIn("Goal (active):", lines)
+        self.assertIn("implement feature X", lines)
+
+    def test_goal_state_runtime_lines_inactive(self):
+        meta = {"goal_state": {"status": "completed", "objective": "done"}}
+        self.assertEqual(goal_state_runtime_lines(meta), [])
+
+    def test_goal_state_runtime_lines_with_summary(self):
+        meta = {"goal_state": {"status": "active", "objective": "refactor", "ui_summary": "Refactor core"}}
+        lines = goal_state_runtime_lines(meta)
+        self.assertIn("Summary: Refactor core", lines)
+
+    def test_goal_state_runtime_lines_truncated(self):
+        long_obj = "x" * (MAX_GOAL_OBJECTIVE_CHARS + 100)
+        meta = {"goal_state": {"status": "active", "objective": long_obj}}
+        lines = goal_state_runtime_lines(meta)
+        self.assertIn("(truncated)", lines[-1])
+
+    def test_goal_state_runtime_lines_empty_objective(self):
+        meta = {"goal_state": {"status": "active", "objective": ""}}
+        lines = goal_state_runtime_lines(meta)
+        self.assertIn("no objective text", " ".join(lines))
+
+
+# ---- Step 16 Tests: Goal Tools ----
+
+class _MockSessionManager:
+    def __init__(self):
+        self._sessions = {}
+
+    def get_or_create(self, key: str) -> Session:
+        if key not in self._sessions:
+            self._sessions[key] = Session(key=key)
+        return self._sessions[key]
+
+
+class TestCreateGoalTool(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from step20.context import RequestContext, bind_request_context
+        self.sessions = _MockSessionManager()
+        self.tool = CreateGoalTool(sessions=self.sessions)
+        self._req_token = bind_request_context(RequestContext(session_key="test_session"))
+
+    def tearDown(self):
+        from step20.context import reset_request_context
+        reset_request_context(self._req_token)
+
+    async def test_create_goal(self):
+        result = await self.tool.execute(objective="Build a feature")
+        self.assertIn("Goal recorded", str(result))
+        sess = self.sessions.get_or_create("test_session")
+        state = sess.metadata.get("goal_state", {})
+        self.assertEqual(state["status"], "active")
+        self.assertEqual(state["objective"], "Build a feature")
+
+    async def test_create_goal_empty(self):
+        result = await self.tool.execute(objective="")
+        self.assertIn("empty", str(result).lower())
+
+    async def test_create_goal_already_active(self):
+        await self.tool.execute(objective="First goal")
+        result = await self.tool.execute(objective="Second goal")
+        self.assertIn("already active", str(result).lower())
+
+    async def test_create_goal_no_session(self):
+        tool = CreateGoalTool()
+        result = await tool.execute(objective="test")
+        self.assertIn("not available", str(result).lower())
+
+    async def test_create_goal_with_summary(self):
+        await self.tool.execute(objective="Refactor", ui_summary="Code refactor")
+        sess = self.sessions.get_or_create("test_session")
+        self.assertEqual(sess.metadata["goal_state"]["ui_summary"], "Code refactor")
+
+
+class TestUpdateGoalTool(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from step20.context import RequestContext, bind_request_context
+        self.sessions = _MockSessionManager()
+        self.tool = UpdateGoalTool(sessions=self.sessions)
+        self._req_token = bind_request_context(RequestContext(session_key="test_session"))
+        self.sessions.get_or_create("test_session").metadata["goal_state"] = {
+            "status": "active", "objective": "test objective",
+        }
+
+    def tearDown(self):
+        from step20.context import reset_request_context
+        reset_request_context(self._req_token)
+
+    async def test_complete_goal(self):
+        result = await self.tool.execute(action="complete", recap="Done and tested")
+        self.assertIn("completed", str(result))
+        sess = self.sessions.get_or_create("test_session")
+        self.assertEqual(sess.metadata["goal_state"]["status"], "completed")
+
+    async def test_cancel_goal(self):
+        result = await self.tool.execute(action="cancel")
+        self.assertIn("cancelled", str(result))
+        sess = self.sessions.get_or_create("test_session")
+        self.assertEqual(sess.metadata["goal_state"]["status"], "cancelled")
+
+    async def test_block_goal(self):
+        result = await self.tool.execute(action="block", recap="Blocked on API")
+        self.assertIn("blocked", str(result))
+        sess = self.sessions.get_or_create("test_session")
+        self.assertEqual(sess.metadata["goal_state"]["status"], "blocked")
+
+    async def test_replace_goal(self):
+        result = await self.tool.execute(action="replace", objective="New objective")
+        self.assertIn("replaced", str(result))
+        sess = self.sessions.get_or_create("test_session")
+        self.assertEqual(sess.metadata["goal_state"]["status"], "active")
+        self.assertEqual(sess.metadata["goal_state"]["objective"], "New objective")
+
+    async def test_replace_missing_objective(self):
+        result = await self.tool.execute(action="replace")
+        self.assertIn("requires", str(result).lower())
+
+    async def test_no_active_goal(self):
+        sess = self.sessions.get_or_create("test_session")
+        sess.metadata.pop("goal_state", None)
+        result = await self.tool.execute(action="complete")
+        self.assertIn("No active goal", str(result))
+
+    async def test_invalid_action(self):
+        result = await self.tool.execute(action="invalid")
+        self.assertIn("one of", str(result).lower())
+
+
+# ---- Step 16 Tests: SpawnTool ----
+
+class TestSpawnTool(unittest.IsolatedAsyncioTestCase):
+    async def test_spawn_no_manager(self):
+        tool = SpawnTool()
+        result = await tool.execute(task="do something")
+        self.assertIn("not available", str(result).lower())
+
+    async def test_spawn_empty_task(self):
+        tool = SpawnTool(manager=object())  # type: ignore
+        result = await tool.execute(task="")
+        self.assertIn("empty", str(result).lower())
+
+
+# ---- Step 16 Tests: SubagentManager ----
+
+class TestSubagentManager(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.bus = MessageBus()
+        self.manager = SubagentManager(bus=self.bus, max_concurrent_subagents=3)
+
+    async def test_get_running_count(self):
+        self.assertEqual(self.manager.get_running_count(), 0)
+
+    async def test_get_running_count_by_session(self):
+        count = self.manager.get_running_count_by_session("test")
+        self.assertEqual(count, 0)
+
+    async def test_spawn_no_provider(self):
+        result = await self.manager.spawn(task="test task")
+        self.assertIn("started", str(result))
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.manager.get_running_count(), 0)  # task finished silently because no provider
+
+    async def test_cancel_by_session(self):
+        result = await self.manager.spawn(task="test", session_key="s1")
+        self.assertIn("started", str(result))
+        cancelled = await self.manager.cancel_by_session("s1")
+        self.assertGreaterEqual(cancelled, 0)
+
+
+# ---- Step 16 Tests: Runner Goal Continuation ----
+
+class TestRunnerGoalContinuation(unittest.IsolatedAsyncioTestCase):
+    async def test_goal_active_continues(self):
+        provider = _MockProvider(LLMResponse(content="Final answer", finish_reason="stop"))
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=ToolRegistry(),
+            provider=provider,
+            max_iterations=5,
+            goal_active_predicate=lambda: True,
+            goal_continue_message="Keep working",
+        )
+        runner = AgentRunner()
+        result = await runner.run(spec)
+        self.assertIsNotNone(result.final_content)
+
+    async def test_goal_inactive_no_continue(self):
+        provider = _MockProvider(LLMResponse(content="Final answer", finish_reason="stop"))
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=ToolRegistry(),
+            provider=provider,
+            max_iterations=5,
+            goal_active_predicate=lambda: False,
+            goal_continue_message="Keep working",
+        )
+        runner = AgentRunner()
+        result = await runner.run(spec)
+        self.assertIn("Final answer", result.final_content or "")
+
+
+# ---- Step 17a Tests: Concurrent Tool Execution ----
+
+class _ConcurrencyTrackingTool(Tool):
+    """Tool that records execution order for concurrency verification."""
+
+    def __init__(self, name: str, delay: float = 0.1, concurrency_safe: bool = True):
+        self._name = name
+        self._delay = delay
+        self._concurrency_safe = concurrency_safe
+        self.execution_order: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return f"Tool {self._name}"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+
+    @property
+    def read_only(self) -> bool:
+        return self._concurrency_safe
+
+    async def execute(self, **kwargs) -> ToolResult:
+        self.execution_order.append(f"start_{self._name}")
+        await asyncio.sleep(self._delay)
+        self.execution_order.append(f"end_{self._name}")
+        return ToolResult(f"result_{self._name}")
+
+
+class _ConcurrentToolCallProvider(LLMProvider):
+    """Provider that returns multiple tool calls on first call, then stops."""
+
+    def __init__(self, tool_names: list[str]):
+        self._tool_names = tool_names
+        self.call_count = 0
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        if self.call_count == 1:
+            calls = [
+                ToolCallRequest(id=f"c{i}", name=name, arguments={"x": name})
+                for i, name in enumerate(self._tool_names)
+            ]
+            return LLMResponse(content="", tool_calls=calls, finish_reason="tool_calls",
+                               usage={"prompt_tokens": 10, "completion_tokens": 5})
+        return LLMResponse(content="done", finish_reason="stop",
+                           usage={"prompt_tokens": 15, "completion_tokens": 8})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class TestConcurrentToolExecution(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_safe_tools_run_in_parallel(self):
+        tool_a = _ConcurrencyTrackingTool("tool_a", delay=0.2, concurrency_safe=True)
+        tool_b = _ConcurrencyTrackingTool("tool_b", delay=0.2, concurrency_safe=True)
+        registry = ToolRegistry()
+        registry.register(tool_a)
+        registry.register(tool_b)
+        provider = _ConcurrentToolCallProvider(["tool_a", "tool_b"])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "run tools"}],
+            tools=registry,
+            provider=provider,
+            max_iterations=3,
+            concurrent_tools=True,
+        )
+        start = asyncio.get_event_loop().time()
+        result = await AgentRunner().run(spec)
+        elapsed = asyncio.get_event_loop().time() - start
+        self.assertIsNotNone(result)
+        # If parallel, total time should be ~0.2s, not ~0.4s
+        self.assertLess(elapsed, 0.35, "Tools should run in parallel")
+
+    async def test_non_safe_tools_run_serially(self):
+        tool_a = _ConcurrencyTrackingTool("tool_a", delay=0.15, concurrency_safe=False)
+        tool_b = _ConcurrencyTrackingTool("tool_b", delay=0.15, concurrency_safe=False)
+        registry = ToolRegistry()
+        registry.register(tool_a)
+        registry.register(tool_b)
+        provider = _ConcurrentToolCallProvider(["tool_a", "tool_b"])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "run tools"}],
+            tools=registry,
+            provider=provider,
+            max_iterations=3,
+            concurrent_tools=True,
+        )
+        start = asyncio.get_event_loop().time()
+        result = await AgentRunner().run(spec)
+        elapsed = asyncio.get_event_loop().time() - start
+        self.assertIsNotNone(result)
+        # Serial: ~0.3s total
+        self.assertGreaterEqual(elapsed, 0.25, "Non-safe tools should run serially")
+
+    async def test_concurrent_tools_disabled_runs_serially(self):
+        tool_a = _ConcurrencyTrackingTool("tool_a", delay=0.15, concurrency_safe=True)
+        tool_b = _ConcurrencyTrackingTool("tool_b", delay=0.15, concurrency_safe=True)
+        registry = ToolRegistry()
+        registry.register(tool_a)
+        registry.register(tool_b)
+        provider = _ConcurrentToolCallProvider(["tool_a", "tool_b"])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "run tools"}],
+            tools=registry,
+            provider=provider,
+            max_iterations=3,
+            concurrent_tools=False,
+        )
+        start = asyncio.get_event_loop().time()
+        result = await AgentRunner().run(spec)
+        elapsed = asyncio.get_event_loop().time() - start
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(elapsed, 0.25, "Should run serially when concurrent_tools=False")
+
+    async def test_mixed_safety_batches_separately(self):
+        safe_tool = _ConcurrencyTrackingTool("safe_tool", delay=0.1, concurrency_safe=True)
+        unsafe_tool = _ConcurrencyTrackingTool("unsafe_tool", delay=0.1, concurrency_safe=False)
+        registry = ToolRegistry()
+        registry.register(safe_tool)
+        registry.register(unsafe_tool)
+        provider = _ConcurrentToolCallProvider(["safe_tool", "unsafe_tool"])
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "run tools"}],
+            tools=registry,
+            provider=provider,
+            max_iterations=3,
+            concurrent_tools=True,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # user + assistant(tool_calls) + 2 tool results + assistant(final) = 5
+        self.assertEqual(len(result.messages), 5)
+        tool_msgs = [m for m in result.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+
+
+# ---- Step 17a Tests: Tool Result Normalization via Runner ----
+
+class _EmptyResultTool(Tool):
+    @property
+    def name(self) -> str:
+        return "empty_tool"
+    @property
+    def description(self) -> str:
+        return "Returns empty result"
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+    async def execute(self, **kwargs) -> ToolResult:
+        return ToolResult("")
+
+
+class _HugeResultTool(Tool):
+    @property
+    def name(self) -> str:
+        return "huge_tool"
+    @property
+    def description(self) -> str:
+        return "Returns huge result"
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+    async def execute(self, **kwargs) -> ToolResult:
+        return ToolResult("x" * 20000)
+
+
+class _NormalizationProvider(LLMProvider):
+    def __init__(self):
+        self.call_count = 0
+    @property
+    def model(self) -> str:
+        return "mock"
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        if self.call_count == 1:
+            return LLMResponse(content="", tool_calls=[
+                ToolCallRequest(id="c1", name="empty_tool", arguments={"x": "a"}),
+                ToolCallRequest(id="c2", name="huge_tool", arguments={"x": "b"}),
+            ], finish_reason="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 5})
+        return LLMResponse(content="done", finish_reason="stop",
+                           usage={"prompt_tokens": 15, "completion_tokens": 8})
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class TestToolResultNormalization(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_tool_result_filled(self):
+        registry = ToolRegistry()
+        registry.register(_EmptyResultTool())
+        registry.register(_HugeResultTool())
+        config = ContextGovernanceConfig(
+            tools=registry,
+            context_window_tokens=200_000,
+            max_tool_result_chars=100,
+        )
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "run tools"}],
+            tools=registry,
+            provider=_NormalizationProvider(),
+            governance_config=config,
+            max_iterations=3,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        tool_msgs = [m for m in result.messages if m["role"] == "tool"]
+        empty_msg = next((m for m in tool_msgs if m["name"] == "empty_tool"), None)
+        self.assertIsNotNone(empty_msg)
+        # Should be filled with "completed with no output"
+        self.assertNotEqual(empty_msg["content"], "")
+        self.assertIn("completed with no output", empty_msg["content"])
+
+    async def test_huge_tool_result_truncated(self):
+        registry = ToolRegistry()
+        registry.register(_EmptyResultTool())
+        registry.register(_HugeResultTool())
+        config = ContextGovernanceConfig(
+            tools=registry,
+            context_window_tokens=200_000,
+            max_tool_result_chars=100,
+        )
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "run tools"}],
+            tools=registry,
+            provider=_NormalizationProvider(),
+            governance_config=config,
+            max_iterations=3,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        tool_msgs = [m for m in result.messages if m["role"] == "tool"]
+        huge_msg = next((m for m in tool_msgs if m["name"] == "huge_tool"), None)
+        self.assertIsNotNone(huge_msg)
+        self.assertLess(len(huge_msg["content"]), 20000)
+        self.assertIn("truncated", huge_msg["content"])
+
+
+# ---- Step 17a Tests: Malformed Tool Call Recovery ----
+
+class _MalformedCallProvider(LLMProvider):
+    """Returns invalid tool call names to test recovery."""
+
+    def __init__(self, fail_count: int = 1):
+        self.call_count = 0
+        self.fail_count = fail_count
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        if self.call_count <= self.fail_count:
+            return LLMResponse(content="", tool_calls=[
+                ToolCallRequest(id="bad1", name="", arguments={"x": "a"}),
+            ], finish_reason="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 5})
+        return LLMResponse(content="recovered", finish_reason="stop",
+                           usage={"prompt_tokens": 15, "completion_tokens": 8})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class _AlwaysMalformedProvider(LLMProvider):
+    """Always returns invalid tool calls to test repeated retry."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        return LLMResponse(content="", tool_calls=[
+            ToolCallRequest(id="bad1", name="", arguments={"x": "a"}),
+        ], finish_reason="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        return await self.chat(messages, tools, model, temperature, max_tokens)
+
+
+class TestMalformedToolCallRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_name_dropped_and_retried(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        provider = _MalformedCallProvider(fail_count=1)
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "use tool"}],
+            tools=registry,
+            provider=provider,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIn("recovered", result.final_content)
+        # The retry message should appear in the conversation
+        retry_msgs = [m for m in result.messages
+                      if isinstance(m.get("content"), str)
+                      and "invalid" in m["content"].lower()]
+        self.assertGreaterEqual(len(retry_msgs), 1)
+
+    async def test_all_invalid_twice_then_fallback(self):
+        """After repeated malformed calls, runner eventually produces a non-tool response."""
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        provider = _AlwaysMalformedProvider()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "do something"}],
+            tools=registry,
+            provider=provider,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # The runner should keep retrying; it may hit max_iterations
+        self.assertIn(result.stop_reason, ("stop", "max_iterations"))
+
+
+# ---- Step 17a Tests: LLM Timeout ----
+
+class _SlowProvider(LLMProvider):
+    """Provider that sleeps longer than the timeout."""
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        await asyncio.sleep(10)
+        return LLMResponse(content="too late", finish_reason="stop",
+                           usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        await asyncio.sleep(10)
+        if on_content_delta:
+            await on_content_delta("too late")
+        return LLMResponse(content="too late", finish_reason="stop",
+                           usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+
+class TestLLMTimeout(unittest.IsolatedAsyncioTestCase):
+    async def test_timeout_returns_error_finish_reason(self):
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_SlowProvider(),
+            llm_timeout_s=0.1,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stop_reason, "error")
+
+    async def test_timeout_in_multi_iteration(self):
+        """Timeout in a multi-iteration run (with tool call) returns error reason."""
+        class _SlowThenFastProvider(LLMProvider):
+            def __init__(self):
+                self.call_count = 0
+            @property
+            def model(self) -> str:
+                return "mock"
+            async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+                self.call_count += 1
+                if self.call_count == 1:
+                    return LLMResponse(content="", tool_calls=[
+                        ToolCallRequest(id="c1", name="echo", arguments={"text": "hi"}),
+                    ], finish_reason="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 5})
+                await asyncio.sleep(10)
+                return LLMResponse(content="too late", finish_reason="stop",
+                                   usage={"prompt_tokens": 15, "completion_tokens": 8})
+            async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                              temperature=0.7, max_tokens=4096,
+                                              on_content_delta=None, retry_config=None):
+                resp = await self.chat(messages, tools, model, temperature, max_tokens)
+                if on_content_delta and resp.content:
+                    await on_content_delta(resp.content)
+                return resp
+
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "do it"}],
+            tools=registry,
+            provider=_SlowThenFastProvider(),
+            llm_timeout_s=0.3,
+            max_iterations=6,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # After first iteration (tool call succeeded), subsequent iterations time out
+        # Empty retries consume extra iterations, but final should be "error"
+        self.assertEqual(result.stop_reason, "error")
+
+
+# ---- Step 17b Tests: Error Termination ----
+
+class _CountingTimeoutProvider(LLMProvider):
+    """Always times out; counts calls."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        await asyncio.sleep(10)
+        return LLMResponse(content="too late", finish_reason="stop",
+                           usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        return await self.chat(messages, tools, model, temperature, max_tokens)
+
+
+class TestErrorTermination(unittest.IsolatedAsyncioTestCase):
+    async def test_error_with_active_goal_stops_immediately(self):
+        """LLM error terminates instead of triggering goal continuation."""
+        provider = _CountingTimeoutProvider()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=provider,
+            llm_timeout_s=0.05,
+            max_iterations=20,
+            goal_active_predicate=lambda: True,
+            goal_continue_message="Continue working",
+        )
+        result = await AgentRunner().run(spec)
+        self.assertEqual(result.stop_reason, "error")
+        self.assertEqual(result.goal_continuation_rounds, 0)
+        self.assertLessEqual(provider.call_count, 2)
+
+    async def test_error_with_injection_callback(self):
+        """LLM error terminates without draining injections."""
+        injector = _InjectingCallback(count=10, msg_count=1)
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=_SlowProvider(),
+            llm_timeout_s=0.05,
+            max_iterations=20,
+            injection_callback=injector.callback,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertEqual(result.stop_reason, "error")
+        self.assertEqual(injector.total_calls, 0)
+        user_msgs = [m for m in result.messages if m["role"] == "user"]
+        self.assertEqual(len(user_msgs), 1)
+
+
+# ---- Step 17b Tests: Empty Content Retry ----
+
+class _EmptyResponseProvider(LLMProvider):
+    """Returns empty content for the first N calls, then a real response."""
+
+    def __init__(self, empty_count: int = 1):
+        self.call_count = 0
+        self.empty_count = empty_count
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        if self.call_count <= self.empty_count:
+            return LLMResponse(content="", finish_reason="stop",
+                               usage={"prompt_tokens": 5, "completion_tokens": 3})
+        return LLMResponse(content="final response", finish_reason="stop",
+                           usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class _AlwaysEmptyProvider(LLMProvider):
+    """Always returns empty content."""
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        return LLMResponse(content="", finish_reason="stop",
+                           usage={"prompt_tokens": 5, "completion_tokens": 3})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        return await self.chat(messages, tools, model, temperature, max_tokens)
+
+
+class TestEmptyContentRetry(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_once_then_succeed(self):
+        """Empty content triggers retry, then succeeds on next call."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_EmptyResponseProvider(empty_count=1),
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stop_reason, "stop")
+        self.assertEqual(result.final_content, "final response")
+
+    async def test_retry_twice_then_succeed(self):
+        """Two empty retries allowed, then succeeds on third call."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_EmptyResponseProvider(empty_count=2),
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stop_reason, "stop")
+        self.assertEqual(result.final_content, "final response")
+
+    async def test_exceed_retries_triggers_finalization_fallback(self):
+        """After _MAX_EMPTY_RETRIES, finalization message is sent without tools."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            tools=_MockToolRegistry(),
+            provider=_AlwaysEmptyProvider(),
+            max_iterations=10,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # Should eventually return a response (even if empty) via finalization fallback
+        self.assertIsNotNone(result.final_content)
+        self.assertIn(result.stop_reason, ("stop", "error"))
+
+
+# ---- Step 17b Tests: Length Recovery ----
+
+class _LengthResponseProvider(LLMProvider):
+    """Returns finish_reason='length' for first N calls, then stop."""
+
+    def __init__(self, length_count: int = 1):
+        self.call_count = 0
+        self.length_count = length_count
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        if self.call_count <= self.length_count:
+            return LLMResponse(content="partial content...", finish_reason="length",
+                               usage={"prompt_tokens": 10, "completion_tokens": 5})
+        return LLMResponse(content="completed response", finish_reason="stop",
+                           usage={"prompt_tokens": 15, "completion_tokens": 8})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class _AlwaysLengthProvider(LLMProvider):
+    """Always returns finish_reason='length'."""
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        return LLMResponse(content="still more to say...", finish_reason="length",
+                           usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class TestLengthRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_once_then_succeed(self):
+        """Length recovery appends prompt and continues, then succeeds."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "write a lot"}],
+            tools=_MockToolRegistry(),
+            provider=_LengthResponseProvider(length_count=1),
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stop_reason, "stop")
+        self.assertEqual(result.final_content, "completed response")
+        # The partial content should be preserved in the assistant message
+        assistant_msgs = [m for m in result.messages if m["role"] == "assistant"]
+        self.assertGreaterEqual(len(assistant_msgs), 2)
+
+    async def test_recovery_capped_at_max(self):
+        """After _MAX_LENGTH_RECOVERIES, stops continuing."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "write a lot"}],
+            tools=_MockToolRegistry(),
+            provider=_AlwaysLengthProvider(),
+            max_iterations=10,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # Should still have content, even if stop_reason is "length" or "max_iterations"
+        self.assertIn(result.final_content, ("still more to say...", "Reached max iterations without a final response."))
+
+
+# ---- Step 17b Tests: Goal Continuation Max Rounds ----
+
+class _GoalCappingProvider(LLMProvider):
+    """Returns text response; call_count tracks iterations."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        return LLMResponse(content=f"response {self.call_count}", finish_reason="stop",
+                           usage={"prompt_tokens": 5, "completion_tokens": 3})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class TestGoalContinuationMaxRounds(unittest.IsolatedAsyncioTestCase):
+    async def test_goal_continuation_capped(self):
+        """Goal continuation stops after _MAX_GOAL_CONTINUATION_ROUNDS."""
+        provider = _GoalCappingProvider()
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=provider,
+            max_iterations=20,
+            goal_active_predicate=lambda: True,
+            goal_continue_message="Continue working",
+            goal_continuation_rounds=0,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.final_content)
+        # Should have stopped due to cap, not max_iterations
+        # With _MAX_GOAL_CONTINUATION_ROUNDS=12 and spec.max_iterations=20,
+        # the cap should trigger before max_iterations
+        self.assertEqual(result.goal_continuation_rounds, 12)
+
+    async def test_goal_continuation_rounds_in_result(self):
+        """goal_continuation_rounds is returned in AgentRunResult."""
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=_GoalCappingProvider(),
+            max_iterations=5,
+            goal_active_predicate=lambda: False,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.goal_continuation_rounds, 0)
+
+
+# ---- Step 17b Tests: Injection Cycles Limit & Merge ----
+
+class _CyclicInjectionProvider(LLMProvider):
+    """Returns tool_calls on first call, then text responses."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    async def chat(self, messages, tools=None, model=None, temperature=0.7, max_tokens=4096):
+        self.call_count += 1
+        if self.call_count == 1:
+            return LLMResponse(content="", tool_calls=[
+                ToolCallRequest(id="c1", name="echo", arguments={"text": "hi"}),
+            ], finish_reason="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 5})
+        return LLMResponse(content=f"text response {self.call_count}", finish_reason="stop",
+                           usage={"prompt_tokens": 15, "completion_tokens": 8})
+
+    async def chat_stream_with_retry(self, messages, tools=None, model=None,
+                                      temperature=0.7, max_tokens=4096,
+                                      on_content_delta=None, retry_config=None):
+        resp = await self.chat(messages, tools, model, temperature, max_tokens)
+        if on_content_delta and resp.content:
+            await on_content_delta(resp.content)
+        return resp
+
+
+class _InjectingCallback:
+    """Callback that returns injected messages a limited number of times."""
+
+    def __init__(self, count: int = 1, msg_count: int = 1):
+        self.remaining = count
+        self.msg_count = msg_count
+        self.total_calls = 0
+
+    async def callback(self) -> list[dict]:
+        self.total_calls += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            return [{"role": "user", "content": f"injected_{i}"}
+                    for i in range(self.msg_count)]
+        return []
+
+
+class TestInjectionCyclesLimit(unittest.IsolatedAsyncioTestCase):
+    async def test_injection_cycles_capped(self):
+        """Injection stops after _MAX_INJECTION_CYCLES even if callback still returns messages."""
+        injector = _InjectingCallback(count=10, msg_count=1)
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=registry,
+            provider=_CyclicInjectionProvider(),
+            injection_callback=injector.callback,
+            max_iterations=20,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        # Should have no more than _MAX_INJECTION_CYCLES (5) injection rounds
+        # Each injection adds a user message
+        user_msgs = [m for m in result.messages if m["role"] == "user"]
+        # Original user msg + up to 5 injected
+        self.assertLessEqual(len(user_msgs), 6)
+
+    async def test_injection_per_turn_capped(self):
+        """Each injection cycle drains at most _MAX_INJECTIONS_PER_TURN messages."""
+        injector = _InjectingCallback(count=1, msg_count=10)
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "start"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            injection_callback=injector.callback,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        user_msgs = [m for m in result.messages if m["role"] == "user"]
+        # Original + at most _MAX_INJECTIONS_PER_TURN (3) injected
+        self.assertLessEqual(len(user_msgs), 4)
+
+
+class TestInjectionMerge(unittest.IsolatedAsyncioTestCase):
+    async def test_adjacent_user_messages_merged(self):
+        """Adjacent user messages from injection are merged into one."""
+        # Use runner's static method directly
+        messages = [{"role": "user", "content": "original"}]
+        injected = [
+            {"role": "user", "content": "first injection"},
+            {"role": "user", "content": "second injection"},
+        ]
+        AgentRunner._append_injected_messages(messages, injected)
+        user_msgs = [m for m in messages if m["role"] == "user"]
+        self.assertEqual(len(user_msgs), 1)
+        self.assertIn("original", user_msgs[0]["content"])
+        self.assertIn("first injection", user_msgs[0]["content"])
+        self.assertIn("second injection", user_msgs[0]["content"])
+
+    async def test_non_user_messages_not_merged(self):
+        """Non-user messages (e.g. tool) are appended separately without merging."""
+        messages = [{"role": "user", "content": "original"}]
+        injected = [
+            {"role": "assistant", "content": "assistant msg"},
+            {"role": "user", "content": "user after assistant"},
+        ]
+        AgentRunner._append_injected_messages(messages, injected)
+        roles = [m["role"] for m in messages]
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(roles, ["user", "assistant", "user"])
+
+    async def test_integration_with_runner(self):
+        """Runner merges injected user messages during execution."""
+        call_count = 0
+        async def multi_inject():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [
+                    {"role": "user", "content": "injected_a"},
+                    {"role": "user", "content": "injected_b"},
+                ]
+            return []
+
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "original"}],
+            tools=_MockToolRegistry(),
+            provider=_MockProvider(),
+            injection_callback=multi_inject,
+            max_iterations=5,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        user_msgs = [m for m in result.messages if m["role"] == "user"]
+        # original + injected (merged into one) = 2 user messages max
+        self.assertLessEqual(len(user_msgs), 2)
+
+
+# ---- Step 18 Tests: Schema ----
+
+from step20.schema import (
+    StringSchema, IntegerSchema, NumberSchema, BooleanSchema,
+    ArraySchema, ObjectSchema, tool_parameters_schema,
+)
+from step20.tool import Schema as SchemaABC
+
+
+class TestSchema(unittest.TestCase):
+    def test_string_schema(self):
+        s = StringSchema("A name", min_length=1, max_length=100)
+        js = s.to_json_schema()
+        self.assertEqual(js["type"], "string")
+        self.assertEqual(js["description"], "A name")
+        self.assertEqual(js["minLength"], 1)
+        self.assertEqual(js["maxLength"], 100)
+
+    def test_integer_schema(self):
+        s = IntegerSchema(description="Count", minimum=0, maximum=100)
+        js = s.to_json_schema()
+        self.assertEqual(js["type"], "integer")
+        self.assertEqual(js["minimum"], 0)
+        self.assertEqual(js["maximum"], 100)
+
+    def test_number_schema(self):
+        s = NumberSchema(description="Price", minimum=0.0)
+        js = s.to_json_schema()
+        self.assertEqual(js["type"], "number")
+        self.assertEqual(js["minimum"], 0.0)
+
+    def test_boolean_schema(self):
+        s = BooleanSchema(description="Enabled", default=True)
+        js = s.to_json_schema()
+        self.assertEqual(js["type"], "boolean")
+        self.assertTrue(js["default"])
+
+    def test_array_schema(self):
+        items = StringSchema()
+        s = ArraySchema(items, description="Tags", min_items=1)
+        js = s.to_json_schema()
+        self.assertEqual(js["type"], "array")
+        self.assertEqual(js["items"], {"type": "string"})
+        self.assertEqual(js["minItems"], 1)
+
+    def test_object_schema(self):
+        s = ObjectSchema({
+            "name": StringSchema("The name"),
+            "count": IntegerSchema(description="Count"),
+        }, required=["name"])
+        js = s.to_json_schema()
+        self.assertEqual(js["type"], "object")
+        self.assertIn("name", js["properties"])
+        self.assertIn("count", js["properties"])
+        self.assertEqual(js["required"], ["name"])
+
+    def test_tool_parameters_schema(self):
+        schema = tool_parameters_schema(
+            text=StringSchema("The text"),
+            required=["text"],
+        )
+        self.assertEqual(schema["type"], "object")
+        self.assertIn("text", schema["properties"])
+        self.assertEqual(schema["required"], ["text"])
+        self.assertEqual(schema["additionalProperties"], False)
+
+
+class TestSchemaValidation(unittest.TestCase):
+    def test_validate_string_valid(self):
+        s = StringSchema(min_length=1, max_length=10)
+        errors = s.validate_value("hello")
+        self.assertEqual(errors, [])
+
+    def test_validate_string_too_short(self):
+        s = StringSchema(min_length=2)
+        errors = s.validate_value("a")
+        self.assertGreater(len(errors), 0)
+
+    def test_validate_integer_enum(self):
+        s = IntegerSchema(enum=[1, 2, 3])
+        errors = s.validate_value(2)
+        self.assertEqual(errors, [])
+        errors = s.validate_value(4)
+        self.assertGreater(len(errors), 0)
+
+    def test_validate_integer_range(self):
+        s = IntegerSchema(minimum=0, maximum=100)
+        errors = s.validate_value(-1)
+        self.assertGreater(len(errors), 0)
+
+    def test_validate_nullable(self):
+        s = StringSchema(nullable=True)
+        errors = s.validate_value(None)
+        self.assertEqual(errors, [])
+
+    def test_validate_object_required(self):
+        s = ObjectSchema({"x": StringSchema()}, required=["x"])
+        errors = s.validate_value({})
+        self.assertGreater(len(errors), 0)
+        errors = s.validate_value({"x": "ok"})
+        self.assertEqual(errors, [])
+
+
+class TestSchemaHelpers(unittest.TestCase):
+    def test_resolve_type(self):
+        self.assertEqual(SchemaABC.resolve_json_schema_type("string"), "string")
+        self.assertEqual(SchemaABC.resolve_json_schema_type(["string", "null"]), "string")
+        self.assertIsNone(SchemaABC.resolve_json_schema_type(None))
+
+    def test_fragment_schema_object(self):
+        s = StringSchema("test")
+        d = SchemaABC.fragment(s)
+        self.assertEqual(d["type"], "string")
+
+    def test_fragment_dict(self):
+        d = {"type": "string"}
+        result = SchemaABC.fragment(d)
+        self.assertIs(result, d)
+
+    def test_subpath(self):
+        self.assertEqual(SchemaABC.subpath("", "a"), "a")
+        self.assertEqual(SchemaABC.subpath("a", "b"), "a.b")
+
+
+class TestCastParams(unittest.TestCase):
+    def setUp(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            count=IntegerSchema("Count"),
+            name=StringSchema("Name"),
+            active=BooleanSchema(description="Active"),
+            required=["count", "name"],
+        ))
+        class _TestTool(Tool):
+            @property
+            def name(self): return "test"
+            @property
+            def description(self): return "test"
+            async def execute(self, **kw): return ToolResult("ok")
+        self.tool = _TestTool()
+
+    def test_cast_int_from_str(self):
+        params = self.tool.cast_params({"count": "42", "name": "foo"})
+        self.assertIsInstance(params["count"], int)
+        self.assertEqual(params["count"], 42)
+
+    def test_cast_bool_from_str(self):
+        params = self.tool.cast_params({"count": 1, "name": "x", "active": "true"})
+        self.assertIsInstance(params["active"], bool)
+        self.assertTrue(params["active"])
+
+    def test_cast_float_from_str(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            price=NumberSchema(description="Price"),
+            required=["price"],
+        ))
+        class _PriceTool(Tool):
+            @property
+            def name(self): return "price"
+            @property
+            def description(self): return "price"
+            async def execute(self, **kw): return ToolResult("ok")
+        params = _PriceTool().cast_params({"price": "3.14"})
+        self.assertIsInstance(params["price"], float)
+        self.assertAlmostEqual(params["price"], 3.14)
+
+
+class TestValidateParams(unittest.TestCase):
+    def test_validate_missing_required(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            name=StringSchema("Name"),
+            required=["name"],
+        ))
+        class _ReqTool(Tool):
+            @property
+            def name(self): return "req"
+            @property
+            def description(self): return "req"
+            async def execute(self, **kw): return ToolResult("ok")
+        errors = _ReqTool().validate_params({})
+        self.assertGreater(len(errors), 0)
+        self.assertIn("name", errors[0])
+
+    def test_validate_type_error(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            count=IntegerSchema("Count"),
+            required=["count"],
+        ))
+        class _IntTool(Tool):
+            @property
+            def name(self): return "int"
+            @property
+            def description(self): return "int"
+            async def execute(self, **kw): return ToolResult("ok")
+        errors = _IntTool().validate_params({"count": "not_an_int"})
+        self.assertGreater(len(errors), 0)
+
+    def test_validate_additional_properties_blocked(self):
+        params = {"count": 1, "extra_field": "bad"}
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            count=IntegerSchema("Count"),
+            required=["count"],
+        ))
+        class _StrictTool(Tool):
+            @property
+            def name(self): return "strict"
+            @property
+            def description(self): return "strict"
+            async def execute(self, **kw): return ToolResult("ok")
+        errors = _StrictTool().validate_params(params)
+        self.assertGreater(len(errors), 0)
+        self.assertIn("extra_field", errors[0])
+
+    def test_validate_pass(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            name=StringSchema("Name"),
+            count=IntegerSchema("Count"),
+            required=["name"],
+        ))
+        class _PassTool(Tool):
+            @property
+            def name(self): return "pass"
+            @property
+            def description(self): return "pass"
+            async def execute(self, **kw): return ToolResult("ok")
+        errors = _PassTool().validate_params({"name": "hello", "count": 5})
+        self.assertEqual(errors, [])
+
+
+class TestToolParametersDecorator(unittest.TestCase):
+    def test_decorator_sets_parameters(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            text=StringSchema("Text"),
+            required=["text"],
+        ))
+        class _DecoratedTool(Tool):
+            @property
+            def name(self): return "decorated"
+            @property
+            def description(self): return "decorated"
+            async def execute(self, **kw): return ToolResult("ok")
+        params = _DecoratedTool().parameters
+        self.assertEqual(params["type"], "object")
+        self.assertIn("text", params["properties"])
+        self.assertEqual(params["required"], ["text"])
+
+    def test_decorator_removes_parameters_from_abstract(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            x=StringSchema("X"),
+        ))
+        class _NoAbstractParams(Tool):
+            @property
+            def name(self): return "noabs"
+            @property
+            def description(self): return "noabs"
+            async def execute(self, **kw): return ToolResult("ok")
+        # Should not raise TypeError about abstract
+        instance = _NoAbstractParams()
+        self.assertEqual(instance.parameters["type"], "object")
+
+    def test_decorator_fresh_copy(self):
+        from step20.tool import tool_parameters
+        @tool_parameters(tool_parameters_schema(
+            x=StringSchema("X"),
+        ))
+        class _CopyTool(Tool):
+            @property
+            def name(self): return "copy"
+            @property
+            def description(self): return "copy"
+            async def execute(self, **kw): return ToolResult("ok")
+        p1 = _CopyTool().parameters
+        p2 = _CopyTool().parameters
+        self.assertIsNot(p1, p2)
+
+
+class TestToolCreate(unittest.TestCase):
+    def test_tool_create_default(self):
+        from step20.context import ToolContext
+        tool = EchoTool.create(ToolContext())
+        self.assertIsInstance(tool, EchoTool)
+        self.assertEqual(tool.name, "echo")
+
+    def test_tool_create_with_context(self):
+        from step20.context import ToolContext
+        tool = SpawnTool.create(ToolContext(subagent_manager=object()))
+        self.assertIsInstance(tool, SpawnTool)
+        self.assertIsNotNone(tool._manager)
+
+    def test_create_goal_tool_create(self):
+        from step20.context import ToolContext
+        tool = CreateGoalTool.create(ToolContext(sessions=object()))
+        self.assertIsInstance(tool, CreateGoalTool)
+        self.assertIsNotNone(tool._sessions)
+
+
+class TestPrepareCall(unittest.TestCase):
+    def test_prepare_call_resolves(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        tool, params, error = registry.prepare_call("echo", {"text": "hello"})
+        self.assertIsNotNone(tool)
+        self.assertIsNone(error)
+        self.assertEqual(params["text"], "hello")
+
+    def test_prepare_call_not_found(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        tool, params, error = registry.prepare_call("unknown", {})
+        self.assertIsNone(tool)
+        self.assertIsNotNone(error)
+
+    def test_prepare_call_suggestion(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        tool, params, error = registry.prepare_call("ECHO", {"text": "hi"})
+        # Current impl: case-sensitive lookup; suggest if fuzzy match
+        self.assertIsNone(tool)
+        # _suggest_name matches by alnum key
+        self.assertIsNotNone(error)
+
+    def test_prepare_call_validation_error(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        tool, params, error = registry.prepare_call("echo", {"text": 123})
+        # text should be string, but cast_params will convert 123 to "123"
+        self.assertIsNotNone(tool)
+        self.assertIsNone(error)  # cast converts 123 -> "123"
+
+    def test_prepare_call_with_arguments_wrapper(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        tool, params, error = registry.prepare_call("echo", {"arguments": '{"text": "hello"}'})
+        self.assertIsNotNone(tool)
+        self.assertIsNone(error)
+        self.assertEqual(params["text"], "hello")
+
+
+class TestToolContext(unittest.IsolatedAsyncioTestCase):
+    async def test_request_context_bind(self):
+        from step20.context import RequestContext, bind_request_context, reset_request_context, current_request_context
+        ctx = RequestContext(session_key="test_sess")
+        token = bind_request_context(ctx)
+        try:
+            self.assertEqual(current_request_context().session_key, "test_sess")
+        finally:
+            reset_request_context(token)
+        self.assertIsNone(current_request_context())
+
+    async def test_request_context_session_key_helper(self):
+        from step20.context import RequestContext, bind_request_context, reset_request_context, current_request_session_key
+        ctx = RequestContext(session_key="my_session")
+        token = bind_request_context(ctx)
+        try:
+            self.assertEqual(current_request_session_key(), "my_session")
+        finally:
+            reset_request_context(token)
+        self.assertIsNone(current_request_session_key())
+
+    async def test_tool_context_construction(self):
+        from step20.context import ToolContext
+        tc = ToolContext(config={"key": "val"}, workspace="/tmp", bus=object())
+        self.assertEqual(tc.workspace, "/tmp")
+        self.assertEqual(tc.config["key"], "val")
+
+    async def test_tool_context_defaults(self):
+        from step20.context import ToolContext
+        tc = ToolContext()
+        self.assertIsNone(tc.config)
+        self.assertEqual(tc.workspace, "")
+        self.assertIsNone(tc.bus)
+
+
+class TestToolLoader(unittest.IsolatedAsyncioTestCase):
+    async def test_discover_finds_tools(self):
+        from step20.loader import ToolLoader
+        loader = ToolLoader(test_classes=[EchoTool, SpawnTool])
+        discovered = loader.discover()
+        names = {cls.__name__ for cls in discovered}
+        self.assertIn("EchoTool", names)
+        self.assertIn("SpawnTool", names)
+
+    async def test_discover_skips_abstract(self):
+        from step20.loader import ToolLoader
+        loader = ToolLoader(test_classes=[])
+        discovered = loader.discover()
+        self.assertEqual(len(discovered), 0)
+
+    async def test_load_registers_tools(self):
+        from step20.context import ToolContext
+        from step20.loader import ToolLoader
+        registry = ToolRegistry()
+        loader = ToolLoader(test_classes=[EchoTool])
+        loader.load(ToolContext(), registry)
+        self.assertTrue(registry.has("echo"))
+
+    async def test_load_filtered_by_scope(self):
+        from step20.context import ToolContext
+        from step20.loader import ToolLoader
+
+        class _OtherScopeTool(Tool):
+            _scopes = {"other"}
+            @property
+            def name(self): return "other"
+            @property
+            def description(self): return "other"
+            @property
+            def parameters(self): return {"type": "object", "properties": {}}
+            async def execute(self, **kw): return ToolResult("ok")
+
+        registry = ToolRegistry()
+        loader = ToolLoader(test_classes=[EchoTool, _OtherScopeTool])
+        loader.load(ToolContext(), registry, scope="core")
+        self.assertTrue(registry.has("echo"))
+        self.assertFalse(registry.has("other"))
+
+    async def test_tool_loader_with_real_discovery(self):
+        from step20.loader import ToolLoader
+        loader = ToolLoader()
+        discovered = loader.discover()
+        names = {cls.__name__ for cls in discovered}
+        # Should find echo, spawn, long_task tools
+        self.assertIn("EchoTool", names)
+        self.assertIn("SpawnTool", names)
+        self.assertIn("CreateGoalTool", names)
+        self.assertIn("UpdateGoalTool", names)
+
+
+class TestRegistryEnhancements(unittest.IsolatedAsyncioTestCase):
+    async def test_get_definitions_sorted(self):
+        registry = ToolRegistry()
+        registry.register(SpawnTool())
+        registry.register(EchoTool())
+        defs = registry.get_definitions()
+        names = [d["function"]["name"] for d in defs]
+        self.assertEqual(names, sorted(names))
+
+    async def test_get_definitions_cached(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        defs1 = registry.get_definitions()
+        defs2 = registry.get_definitions()
+        self.assertIs(defs1, defs2)
+
+    async def test_get_runtime_context_providers(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        providers = registry.get_runtime_context_providers()
+        self.assertEqual(providers, [])
+
+    async def test_tool_registry_contains(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        self.assertIn("echo", registry)
+        self.assertNotIn("unknown", registry)
+
+    async def test_tool_registry_len(self):
+        registry = ToolRegistry()
+        self.assertEqual(len(registry), 0)
+        registry.register(EchoTool())
+        self.assertEqual(len(registry), 1)
+
+    async def test_tool_names_property(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        registry.register(SpawnTool())
+        names = registry.tool_names
+        self.assertIn("echo", names)
+        self.assertIn("spawn", names)
+
+
+class TestRegistryExecuteViaPrepareCall(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_with_prepare_call(self):
+        from step20.context import RequestContext, bind_request_context, reset_request_context
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        ctx = RequestContext()
+        token = bind_request_context(ctx)
+        try:
+            result = await registry.execute("echo", text="hello")
+            self.assertEqual(str(result), "Echo: hello")
+        finally:
+            reset_request_context(token)
+
+    async def test_execute_not_found(self):
+        registry = ToolRegistry()
+        result = await registry.execute("unknown")
+        self.assertIn("not found", str(result).lower())
+
+    async def test_execute_with_tool_error(self):
+        class _FailingTool(Tool):
+            @property
+            def name(self): return "fail"
+            @property
+            def description(self): return "fail"
+            @property
+            def parameters(self): return {"type": "object", "properties": {}}
+            async def execute(self, **kw): return ToolResult.error("failed intentionally")
+        registry = ToolRegistry()
+        registry.register(_FailingTool())
+        result = await registry.execute("fail")
+        self.assertTrue(result.is_error)
+        self.assertIn("failed", str(result).lower())
+
+
+class TestStep18Integration(unittest.IsolatedAsyncioTestCase):
+    async def test_prepare_call_with_runner(self):
+        from step20.context import RequestContext
+        class _CallProvider(LLMProvider):
+            @property
+            def model(self): return "mock"
+            async def chat(self, messages, **kw):
+                is_first = messages[-1].get("role") == "user" if messages else True
+                if is_first:
+                    return LLMResponse(content="", tool_calls=[
+                        ToolCallRequest(id="c1", name="echo", arguments={"text": "hello"}),
+                    ], finish_reason="tool_calls", usage={})
+                return LLMResponse(content="done", finish_reason="stop", usage={})
+            async def chat_stream_with_retry(self, **kw): return await self.chat(kw.get("messages", []))
+
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        spec = AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "hi"}],
+            tools=registry,
+            provider=_CallProvider(),
+            max_iterations=3,
+        )
+        result = await AgentRunner().run(spec)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.final_content, "done")
+
+    async def test_full_tool_loader_with_loop(self):
+        bus = MessageBus()
+        provider = _MockProvider()
+        registry = ToolRegistry()
+        tmp = tempfile.mkdtemp()
+        session_manager = SessionManager(workspace=tmp)
+        context_builder = ContextBuilder(workspace=".")
+        memory = MemoryStore(workspace=tmp)
+        loop = AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=session_manager, context_builder=context_builder,
+            memory=memory, identity="You are a test bot.",
+            replay_budget=10000,
+        )
+        task = asyncio.create_task(loop.run())
+        await bus.publish_inbound(InboundMessage(content="hello", chat_id="test"))
+        response = await bus.consume_outbound()
+        self.assertIsNotNone(response.content)
+        # Registry should have tools loaded by ToolLoader
+        self.assertGreater(len(registry), 0)
+        loop.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+class TestStorageKeyEncoding(unittest.TestCase):
+    def test_roundtrip(self):
+        mgr = SessionManager(workspace=tempfile.mkdtemp())
+        for key in ["default", "cli:direct", "中文:会话", "a/b\\c?d*e"]:
+            stem = mgr._storage_key(key)
+            self.assertEqual(mgr._decode_storage_key(stem), key)
+
+    def test_collision_resistant(self):
+        mgr = SessionManager(workspace=tempfile.mkdtemp())
+        self.assertNotEqual(mgr._storage_key("a:b"), mgr._storage_key("a_b"))
+
+    def test_safe_key(self):
+        self.assertEqual(SessionManager.safe_key("cli:direct"), "cli_direct")
+        self.assertEqual(SessionManager.safe_key("a<b>c"), "a_b_c")
+
+    def test_decode_garbage(self):
+        mgr = SessionManager(workspace=tempfile.mkdtemp())
+        self.assertIsNone(mgr._decode_storage_key("!!!not-base64!!!"))
+
+    def test_legacy_migration(self):
+        tmp = tempfile.mkdtemp()
+        mgr = SessionManager(workspace=tmp)
+        key = "cli:direct"
+        legacy = mgr._get_legacy_lossy_path(key)
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        sess = Session(key=key)
+        sess.add_message("user", "hello")
+        with open(legacy, "w", encoding="utf-8") as f:
+            f.write('{"_type": "metadata", "key": "cli:direct"}\n')
+            f.write(json.dumps(sess.messages[0], ensure_ascii=False) + "\n")
+        loaded = mgr.get_or_create(key)
+        self.assertEqual(loaded.key, key)
+        self.assertEqual(len(loaded.messages), 1)
+        self.assertTrue(mgr._get_session_path(key).exists())
+        self.assertFalse(legacy.exists())
+
+
+class TestTwoLevelCache(unittest.TestCase):
+    def _make(self, size=2):
+        return SessionManager(workspace=tempfile.mkdtemp(), max_cached_sessions=size)
+
+    def test_hot_cache_identity(self):
+        mgr = self._make()
+        a = mgr.get_or_create("a")
+        self.assertIs(mgr.get_or_create("a"), a)
+        self.assertIn("a", mgr._cache)
+
+    def test_evicts_to_overflow_preserves_identity(self):
+        mgr = self._make(2)
+        a = mgr.get_or_create("a")
+        b = mgr.get_or_create("b")
+        c = mgr.get_or_create("c")
+        self.assertNotIn("a", mgr._cache)
+        self.assertIn("a", mgr._overflow_cache)
+        self.assertIs(mgr.get_or_create("a"), a)
+        self.assertIn("a", mgr._cache)
+
+    def test_evicted_gc_reloads_from_disk(self):
+        mgr = self._make(1)
+        a = mgr.get_or_create("a")
+        a.add_message("user", "persisted")
+        mgr.save(a)
+        mgr.get_or_create("b")
+        del a
+        gc.collect()
+        fresh = mgr.get_or_create("a")
+        self.assertEqual(len(fresh.messages), 1)
+
+    def test_invalidate(self):
+        mgr = self._make()
+        a = mgr.get_or_create("a")
+        a.add_message("user", "x")
+        mgr.save(a)
+        mgr.invalidate("a")
+        self.assertNotIn("a", mgr._cache)
+        self.assertNotIn("a", mgr._overflow_cache)
+        reloaded = mgr.get_or_create("a")
+        self.assertIsNot(reloaded, a)
+        self.assertEqual(len(reloaded.messages), 1)
+
+
+class TestRetentionSuffix(unittest.TestCase):
+    def _session(self, n):
+        s = Session(key="t")
+        for i in range(n):
+            s.add_message("user" if i % 2 == 0 else "assistant", f"msg {i}")
+        return s
+
+    def test_basic_truncation(self):
+        s = self._session(10)
+        result = s.retain_recent_legal_suffix(4)
+        self.assertEqual(len(s.messages), 4)
+        self.assertEqual(len(result.dropped), 6)
+        self.assertEqual(result.already_consolidated_count, 0)
+        self.assertEqual(s.messages[0]["content"], "msg 6")
+
+    def test_extend_to_user(self):
+        s = self._session(10)
+        result = s.retain_recent_legal_suffix(3, extend_to_user=True)
+        self.assertEqual(s.messages[0]["role"], "user")
+        self.assertLessEqual(len(s.messages), 4)
+
+    def test_orphan_tool_result_trimmed(self):
+        s = Session(key="t")
+        s.add_message("user", "do it")
+        s.add_message("assistant", "", tool_calls=[{"id": "t1", "function": {"name": "x", "arguments": "{}"}}])
+        s.add_message("tool", "result", tool_call_id="t1")
+        s.add_message("user", "more")
+        result = s.retain_recent_legal_suffix(2)
+        self.assertEqual(len(s.messages), 1)
+        self.assertEqual(s.messages[0]["role"], "user")
+        self.assertEqual(len(result.dropped), 3)
+
+    def test_consolidated_prefix_counting(self):
+        s = self._session(10)
+        s.last_consolidated = 3
+        result = s.retain_recent_legal_suffix(4)
+        self.assertEqual(len(s.messages), 4)
+        self.assertEqual(s.last_consolidated, 0)
+        self.assertEqual(result.already_consolidated_count, 3)
+        self.assertEqual(len(result.dropped), 6)
+
+    def test_clear_keeps_consolidation_count(self):
+        s = self._session(5)
+        s.last_consolidated = 2
+        result = s.retain_recent_legal_suffix(0)
+        self.assertEqual(s.messages, [])
+        self.assertEqual(result.already_consolidated_count, 2)
+
+
+class TestEnforceFileCap(unittest.TestCase):
+    def test_under_cap_noop(self):
+        s = Session(key="t")
+        for i in range(10):
+            s.add_message("user", f"m{i}")
+        archived = []
+        s.enforce_file_cap(on_archive=archived.append, limit=100)
+        self.assertEqual(len(s.messages), 10)
+        self.assertEqual(archived, [])
+
+    def test_over_cap_archives(self):
+        s = Session(key="t")
+        for i in range(50):
+            s.add_message("user", f"m{i}")
+        archived = []
+        s.enforce_file_cap(on_archive=archived.append, limit=10)
+        self.assertEqual(len(s.messages), 10)
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(len(archived[0]), 40)
+
+    def test_consolidated_prefix_not_archived(self):
+        s = Session(key="t")
+        for i in range(20):
+            s.add_message("user", f"m{i}")
+        s.last_consolidated = 12
+        archived = []
+        s.enforce_file_cap(on_archive=archived.append, limit=8)
+        self.assertEqual(len(s.messages), 8)
+        self.assertEqual(archived, [])
+        self.assertEqual(s.last_consolidated, 0)
+
+
+class TestAutoCompact(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.sessions = SessionManager(workspace=self.tmp)
+        self.store = MemoryStore(workspace=self.tmp)
+        self.conso = Consolidator(
+            store=self.store, sessions=self.sessions,
+            build_messages=lambda **kw: [], get_tool_definitions=lambda: [],
+        )
+        self.compact = AutoCompact(self.sessions, self.conso, session_ttl_minutes=1)
+        self._runtime = lambda: Runtime(context_window_tokens=10000, max_tokens=1024)
+
+    def test_is_expired(self):
+        now = datetime.now()
+        self.assertTrue(self.compact._is_expired((now - timedelta(minutes=2)).isoformat(), now))
+        self.assertFalse(self.compact._is_expired((now - timedelta(seconds=30)).isoformat(), now))
+        self.assertFalse(self.compact._is_expired(None, now))
+        disabled = AutoCompact(self.sessions, self.conso, session_ttl_minutes=0)
+        self.assertFalse(disabled._is_expired((now - timedelta(hours=2)).isoformat(), now))
+
+    def test_has_compactable_idle_tail(self):
+        busy = self.sessions.get_or_create("busy")
+        for i in range(30):
+            busy.add_message("user", f"m{i}")
+        self.assertTrue(self.compact._has_compactable_idle_tail("busy"))
+        self.sessions.get_or_create("empty")
+        self.assertFalse(self.compact._has_compactable_idle_tail("empty"))
+        small = self.sessions.get_or_create("small")
+        for i in range(3):
+            small.add_message("user", f"m{i}")
+        self.assertFalse(self.compact._has_compactable_idle_tail("small"))
+
+    def test_check_expired_skips_active_and_internal(self):
+        idle = self.sessions.get_or_create("idle2")
+        for i in range(30):
+            idle.add_message("user", f"m{i}")
+        idle.updated_at = (datetime.now() - timedelta(minutes=10)).isoformat()
+        self.sessions.save(idle)
+        dream = self.sessions.get_or_create("dream:2026")
+        for i in range(30):
+            dream.add_message("user", f"d{i}")
+        dream.updated_at = (datetime.now() - timedelta(minutes=10)).isoformat()
+        self.sessions.save(dream)
+        scheduled = []
+        self.compact.check_expired(
+            lambda coro: scheduled.append(coro),
+            self._runtime,
+            active_session_keys={"idle2"},
+        )
+        self.assertEqual(scheduled, [])
+
+    async def test_check_expired_schedules_and_archives(self):
+        idle = self.sessions.get_or_create("idle")
+        for i in range(30):
+            idle.add_message("user", f"m{i}")
+        idle.updated_at = (datetime.now() - timedelta(minutes=10)).isoformat()
+        self.sessions.save(idle)
+        scheduled = []
+        self.compact.check_expired(lambda coro: scheduled.append(coro), self._runtime)
+        self.assertEqual(len(scheduled), 1)
+        await scheduled[0]
+        reloaded = self.sessions.get_or_create("idle")
+        self.assertLessEqual(len(reloaded.messages), 8)
+
+    async def test_prepare_session_summary_cold_path(self):
+        s = self.sessions.get_or_create("sum")
+        s.metadata["_last_summary"] = {
+            "text": "Old summary",
+            "last_active": "2026-01-01T00:00:00",
+        }
+        self.sessions.save(s)
+        session, pending = self.compact.prepare_session(s, "sum")
+        self.assertIs(session, s)
+        self.assertIsNotNone(pending)
+        self.assertIn("Previous conversation summary", pending)
+        self.assertIn("Old summary", pending)
+
+    async def test_prepare_session_internal_and_clean(self):
+        s = self.sessions.get_or_create("dream:x")
+        _, pending = self.compact.prepare_session(s, "dream:x")
+        self.assertIsNone(pending)
+        s2 = self.sessions.get_or_create("plain")
+        _, pending = self.compact.prepare_session(s2, "plain")
+        self.assertIsNone(pending)
+
+
+class TestPendingUserTurn(unittest.IsolatedAsyncioTestCase):
+    def _make_loop(self):
+        bus = MessageBus()
+        provider = _MockProvider()
+        registry = _MockToolRegistry()
+        tmp = tempfile.mkdtemp()
+        return AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=SessionManager(workspace=tmp),
+            context_builder=ContextBuilder(workspace="."),
+            memory=MemoryStore(workspace=tmp),
+            identity="You are a test bot.", replay_budget=10000,
+        )
+
+    def setUp(self):
+        self.loop = self._make_loop()
+
+    def test_mark_clear(self):
+        s = Session(key="t")
+        self.loop._mark_pending_user_turn(s)
+        self.assertTrue(s.metadata.get("pending_user_turn"))
+        self.loop._clear_pending_user_turn(s)
+        self.assertNotIn("pending_user_turn", s.metadata)
+
+    def test_restore_appends_error(self):
+        s = Session(key="t")
+        s.add_message("user", "hi")
+        self.loop._mark_pending_user_turn(s)
+        result = self.loop._restore_pending_user_turn(s)
+        self.assertTrue(result)
+        self.assertEqual(s.messages[-1]["role"], "assistant")
+        self.assertIn("interrupted", s.messages[-1]["content"])
+        self.assertNotIn("pending_user_turn", s.metadata)
+
+    def test_restore_noop_without_flag(self):
+        s = Session(key="t")
+        s.add_message("user", "hi")
+        self.assertFalse(self.loop._restore_pending_user_turn(s))
+        self.assertEqual(len(s.messages), 1)
+
+    def test_restore_clears_flag_without_user_tail(self):
+        s = Session(key="t")
+        s.add_message("assistant", "hi")
+        self.loop._mark_pending_user_turn(s)
+        self.assertTrue(self.loop._restore_pending_user_turn(s))
+        self.assertEqual(len(s.messages), 1)
+        self.assertNotIn("pending_user_turn", s.metadata)
+
+
+class TestForkSession(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.mgr = SessionManager(workspace=self.tmp)
+
+    def _fill(self):
+        s = self.mgr.get_or_create("src")
+        s.add_message("user", "A")
+        s.add_message("assistant", "a")
+        s.add_message("user", "B")
+        s.add_message("assistant", "b")
+        s.add_message("user", "C")
+        s.metadata["goal_state"] = {"status": "active"}
+        s.metadata["_last_summary"] = {"text": "sum"}
+        s.last_consolidated = 2
+        self.mgr.save(s)
+        return s
+
+    def test_fork_before_first_user(self):
+        self._fill()
+        target = self.mgr.fork_session_before_user_index("src", "dst0", 0)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.messages, [])
+
+    def test_fork_mid_strips_volatile_metadata(self):
+        s = self._fill()
+        s.last_consolidated = 3
+        self.mgr.save(s)
+        target = self.mgr.fork_session_before_user_index("src", "dst1", 1)
+        self.assertEqual([m["content"] for m in target.messages], ["A", "a"])
+        self.assertNotIn("goal_state", target.metadata)
+        self.assertNotIn("pending_user_turn", target.metadata)
+        self.assertNotIn("_last_summary", target.metadata)
+        self.assertEqual(target.last_consolidated, 0)
+
+    def test_fork_persisted_and_reloadable(self):
+        self._fill()
+        self.mgr.fork_session_before_user_index("src", "dstP", 2)
+        fresh = SessionManager(workspace=self.tmp).get_or_create("dstP")
+        self.assertEqual([m["content"] for m in fresh.messages], ["A", "a", "B", "b"])
+        self.assertEqual(fresh.last_consolidated, 2)
+
+    def test_fork_out_of_range(self):
+        self._fill()
+        self.assertIsNone(self.mgr.fork_session_before_user_index("src", "dstX", 99))
+        self.assertIsNone(self.mgr.fork_session_before_user_index("src", "dstN", -1))
+
+
+class TestListSessions(unittest.TestCase):
+    def test_list_decodes_and_sorts(self):
+        tmp = tempfile.mkdtemp()
+        mgr = SessionManager(workspace=tmp)
+        s1 = mgr.get_or_create("cli:one")
+        s1.add_message("user", "first message")
+        s1.updated_at = "2026-01-01T10:00:00"
+        mgr.save(s1)
+        s2 = mgr.get_or_create("cli:two")
+        s2.add_message("user", "second message")
+        s2.updated_at = "2026-01-02T10:00:00"
+        mgr.save(s2)
+        items = mgr.list_sessions()
+        self.assertEqual([i["key"] for i in items], ["cli:two", "cli:one"])
+        self.assertEqual(items[0]["preview"], "second message")
+
+    def test_list_empty(self):
+        mgr = SessionManager(workspace=tempfile.mkdtemp())
+        self.assertEqual(mgr.list_sessions(), [])
+
+
+class TestStep19Integration(unittest.IsolatedAsyncioTestCase):
+    def _make_loop(self, session_manager, session_ttl_minutes=0):
+        bus = MessageBus()
+        provider = _MockProvider()
+        registry = _MockToolRegistry()
+        return AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=session_manager,
+            context_builder=ContextBuilder(workspace="."),
+            memory=MemoryStore(workspace=session_manager.sessions_dir.parent),
+            identity="You are a test bot.", replay_budget=10000,
+            session_ttl_minutes=session_ttl_minutes,
+        )
+
+    async def test_crash_recovery_end_to_end(self):
+        tmp = tempfile.mkdtemp()
+        sessions = SessionManager(workspace=tmp)
+        loop = self._make_loop(sessions)
+
+        class _CrashingProvider:
+            @property
+            def model(self):
+                raise RuntimeError("provider error")
+
+        loop.provider = _CrashingProvider()
+        result = await loop._process_message(
+            InboundMessage(content="hi", chat_id="crash"), "crash",
+        )
+        self.assertIsNotNone(result)
+        session = sessions.get_or_create("crash")
+        self.assertEqual(session.messages[-1]["role"], "user")
+        self.assertTrue(session.metadata.get("pending_user_turn"))
+
+        restart_sessions = SessionManager(workspace=tmp)
+        loop2 = self._make_loop(restart_sessions)
+        await loop2._state_restore(
+            TurnContext(msg=InboundMessage(content="hi2", chat_id="crash"), session_key="crash")
+        )
+        session2 = restart_sessions.get_or_create("crash")
+        self.assertEqual(session2.messages[-1]["role"], "assistant")
+        self.assertIn("interrupted", session2.messages[-1]["content"])
+        self.assertNotIn("pending_user_turn", session2.metadata)
+
+    async def test_auto_compact_end_to_end(self):
+        tmp = tempfile.mkdtemp()
+        sessions = SessionManager(workspace=tmp)
+        loop = self._make_loop(sessions, session_ttl_minutes=1)
+        s = sessions.get_or_create("idle")
+        for i in range(40):
+            s.add_message("user", f"m{i}")
+        s.updated_at = (datetime.now() - timedelta(minutes=30)).isoformat()
+        sessions.save(s)
+        scheduled = []
+        loop.auto_compact.check_expired(
+            lambda coro: scheduled.append(coro),
+            lambda: loop.runtime,
+            active_session_keys=set(),
+        )
+        self.assertEqual(len(scheduled), 1)
+        await scheduled[0]
+        session = sessions.get_or_create("idle")
+        self.assertLessEqual(len(session.messages), 8)
+
+
+class _EchoChannel(BaseChannel):
+    name = "echo"
+    display_name = "Echo"
+
+    def __init__(self, config=None, bus=None, pairing=None):
+        super().__init__(config, bus, pairing)
+        self.sent: list[OutboundMessage] = []
+
+    async def start(self):
+        self._running = True
+
+    async def stop(self):
+        self._running = False
+
+    async def send(self, msg: OutboundMessage) -> None:
+        self.sent.append(msg)
+
+
+class _StreamingChannel(_EchoChannel):
+    async def send_delta(
+        self, chat_id, delta, metadata=None, *, stream_id=None,
+        stream_end=False, resuming=False,
+    ) -> None:
+        return
+
+
+class TestPairingStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = PairingStore(path=Path(self.tmp) / "pairing.json")
+
+    def test_generate_approve_roundtrip(self):
+        code = self.store.generate_code("cli", "user1")
+        self.assertRegex(code, r"^[A-Z0-9]{4}-[A-Z0-9]{4}$")
+        self.assertFalse(self.store.is_approved("cli", "user1"))
+        result = self.store.approve_code(code)
+        self.assertEqual(result, ("cli", "user1"))
+        self.assertTrue(self.store.is_approved("cli", "user1"))
+        self.assertIsNone(self.store.approve_code(code))
+
+    def test_ttl_expiry(self):
+        code = self.store.generate_code("cli", "user1", ttl=-1)
+        self.assertIsNone(self.store.approve_code(code))
+        self.assertFalse(self.store.is_approved("cli", "user1"))
+
+    def test_deny_code(self):
+        code = self.store.generate_code("cli", "user1")
+        self.assertTrue(self.store.deny_code(code))
+        self.assertFalse(self.store.deny_code(code))
+        self.assertFalse(self.store.is_approved("cli", "user1"))
+
+    def test_persistence_across_instances(self):
+        code = self.store.generate_code("cli", "user1")
+        self.store.approve_code(code)
+        store2 = PairingStore(path=Path(self.tmp) / "pairing.json")
+        self.assertTrue(store2.is_approved("cli", "user1"))
+        self.assertEqual(store2.get_approved("cli"), ["user1"])
+        self.assertEqual(store2.list_pending(), [])
+
+    def test_corrupt_file_reset(self):
+        Path(self.tmp, "pairing.json").write_text("{not json", encoding="utf-8")
+        code = self.store.generate_code("cli", "user1")
+        self.assertIsNotNone(code)
+
+    def test_clear_channel(self):
+        code = self.store.generate_code("cli", "user1")
+        self.store.approve_code(code)
+        self.store.generate_code("cli", "user2")
+        tg_code = self.store.generate_code("tg", "other")
+        self.store.approve_code(tg_code)
+        result = self.store.clear_channel("cli")
+        self.assertEqual(result, {"approved": 1, "pending": 1})
+        self.assertFalse(self.store.is_approved("cli", "user1"))
+        self.assertTrue(all(p["channel"] != "cli" for p in self.store.list_pending()))
+        self.assertTrue(self.store.is_approved("tg", "other"))
+
+    def test_revoke(self):
+        code = self.store.generate_code("cli", "user1")
+        self.store.approve_code(code)
+        self.assertTrue(self.store.revoke("cli", "user1"))
+        self.assertFalse(self.store.revoke("cli", "user1"))
+        self.assertEqual(self.store.revoke_channel("cli"), 0)
+        code2 = self.store.generate_code("cli", "user2")
+        self.store.approve_code(code2)
+        self.assertEqual(self.store.revoke_channel("cli"), 1)
+
+    def test_handle_pairing_command(self):
+        code = self.store.generate_code("cli", "user1")
+        self.assertIn(code, self.store.handle_pairing_command("cli", "list"))
+        reply = self.store.handle_pairing_command("cli", f"approve {code}")
+        self.assertIn("user1", reply)
+        self.assertTrue(self.store.is_approved("cli", "user1"))
+        self.assertIn("No pending", self.store.handle_pairing_command("cli", "list"))
+        self.assertIn("Invalid", self.store.handle_pairing_command("cli", "approve BAD-CODE"))
+        self.assertIn("not found", self.store.handle_pairing_command("cli", "deny XYZ1"))
+        self.assertIn("Revoked", self.store.handle_pairing_command("cli", "revoke user1"))
+        self.assertFalse(self.store.is_approved("cli", "user1"))
+        self.assertIn("Unknown", self.store.handle_pairing_command("cli", "bogus"))
+
+    def test_format_pairing_reply(self):
+        reply = self.store.format_pairing_reply("ABCD-EFGH")
+        self.assertIn("ABCD-EFGH", reply)
+        self.assertIn("pairing code", reply.lower())
+
+
+class TestBaseChannel(unittest.IsolatedAsyncioTestCase):
+    def _store(self):
+        return PairingStore(path=Path(tempfile.mkdtemp()) / "pairing.json")
+
+    def test_is_allowed_star(self):
+        ch = _EchoChannel({"allow_from": ["*"]}, MessageBus(), self._store())
+        self.assertTrue(ch.is_allowed("anyone"))
+
+    def test_is_allowed_allowfrom_exact(self):
+        ch = _EchoChannel({"allow_from": ["alice"]}, MessageBus(), self._store())
+        self.assertTrue(ch.is_allowed("alice"))
+        self.assertFalse(ch.is_allowed("bob"))
+
+    def test_is_allowed_pairing_approved(self):
+        store = self._store()
+        code = store.generate_code("echo", "42")
+        store.approve_code(code)
+        ch = _EchoChannel({}, MessageBus(), store)
+        self.assertTrue(ch.is_allowed("42"))
+        self.assertFalse(ch.is_allowed("43"))
+
+    def test_is_allowed_denied_default(self):
+        ch = _EchoChannel({}, MessageBus(), self._store())
+        self.assertFalse(ch.is_allowed("anyone"))
+
+    async def test_handle_message_publishes(self):
+        bus = MessageBus()
+        ch = _EchoChannel({"allow_from": ["*"]}, bus, self._store())
+        await ch._handle_message(
+            "alice", "chat1", "hello", media=["a.png"],
+            metadata={"x": 1}, session_key="custom", is_dm=True,
+        )
+        msg = await bus.consume_inbound()
+        self.assertEqual(msg.channel, "echo")
+        self.assertEqual(msg.sender_id, "alice")
+        self.assertEqual(msg.chat_id, "chat1")
+        self.assertEqual(msg.content, "hello")
+        self.assertEqual(msg.media, ["a.png"])
+        self.assertEqual(msg.metadata, {"x": 1})
+        self.assertEqual(msg.session_key_override, "custom")
+        self.assertEqual(ch.sent, [])
+
+    async def test_handle_message_wants_stream_flag(self):
+        bus = MessageBus()
+        ch = _StreamingChannel({"allow_from": ["*"], "streaming": True}, bus, self._store())
+        await ch._handle_message("alice", "c", "hi")
+        msg = await bus.consume_inbound()
+        self.assertTrue(msg.metadata.get("_wants_stream"))
+        bus2 = MessageBus()
+        ch2 = _StreamingChannel({"allow_from": ["*"]}, bus2, self._store())
+        await ch2._handle_message("alice", "c", "hi")
+        msg2 = await bus2.consume_inbound()
+        self.assertNotIn("_wants_stream", msg2.metadata)
+
+    async def test_handle_message_denied_dm_pairing(self):
+        store = self._store()
+        bus = MessageBus()
+        ch = _EchoChannel({}, bus, store)
+        await ch._handle_message("stranger", "chat1", "hi", is_dm=True)
+        self.assertEqual(len(ch.sent), 1)
+        reply = ch.sent[0]
+        self.assertEqual(reply.channel, "echo")
+        self.assertEqual(reply.chat_id, "chat1")
+        code = reply.metadata.get(PAIRING_CODE_META_KEY)
+        self.assertIsNotNone(code)
+        self.assertIn(code, reply.content)
+        self.assertTrue(bus.inbound.empty())
+        result = store.approve_code(code)
+        self.assertEqual(result, ("echo", "stranger"))
+        self.assertTrue(ch.is_allowed("stranger"))
+
+    async def test_handle_message_denied_non_dm_silent(self):
+        bus = MessageBus()
+        ch = _EchoChannel({}, bus, self._store())
+        await ch._handle_message("stranger", "chat1", "hi")
+        self.assertEqual(ch.sent, [])
+        self.assertTrue(bus.inbound.empty())
+
+    def test_supports_streaming(self):
+        self.assertTrue(_StreamingChannel({"streaming": True}).supports_streaming)
+        self.assertFalse(_StreamingChannel({}).supports_streaming)
+        self.assertFalse(_EchoChannel({"streaming": True}).supports_streaming)
+
+    async def test_lifecycle_and_default_config(self):
+        self.assertEqual(_EchoChannel.default_config(), {"enabled": False})
+        ch = _EchoChannel()
+        self.assertFalse(ch.is_running)
+        await ch.start()
+        self.assertTrue(ch.is_running)
+        await ch.stop()
+        self.assertFalse(ch.is_running)
+
+    async def test_send_delta_default_noop(self):
+        await _EchoChannel().send_delta("c", "x", stream_end=True)
+
+
+class TestCliChannel(unittest.IsolatedAsyncioTestCase):
+    def _make_channel(self, **kwargs):
+        bus = kwargs.pop("bus", None) or MessageBus()
+        return CliChannel({"allow_from": ["*"]}, bus, **kwargs), bus
+
+    async def test_start_publishes_and_exits(self):
+        channel, bus = self._make_channel(chat_id="sess1")
+        got = []
+        with mock.patch("step20.channels.cli.ainput", side_effect=["hello", "/exit"]):
+            async def responder():
+                msg = await bus.consume_inbound()
+                got.append(msg)
+                await channel.send(OutboundMessage(content="reply", metadata={"stop_reason": "stop"}))
+            resp_task = asyncio.create_task(responder())
+            await channel.start()
+            await resp_task
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].content, "hello")
+        self.assertEqual(got[0].channel, "cli")
+        self.assertEqual(got[0].chat_id, "sess1")
+        self.assertFalse(channel.is_running)
+
+    async def test_send_prints_and_sets_turn_done(self):
+        channel, _ = self._make_channel()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            await channel.send(OutboundMessage(
+                content="hi there", metadata={"stop_reason": "stop", "tokens": 7},
+            ))
+        out = buf.getvalue()
+        self.assertIn("[stop]", out)
+        self.assertIn("hi there", out)
+        self.assertIn("tokens: 7", out)
+        self.assertTrue(channel._turn_done.is_set())
+
+    async def test_send_delta_buffers_until_stream_end(self):
+        channel, _ = self._make_channel()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            await channel.send_delta("c", "Hel")
+            await channel.send_delta("c", "lo")
+            self.assertEqual(buf.getvalue(), "")
+            await channel.send_delta("c", "", stream_end=True)
+        self.assertEqual(buf.getvalue(), "Hello\n")
+
+    async def test_send_delta_stream_end_with_delta(self):
+        channel, _ = self._make_channel()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            await channel.send_delta("c", "He", stream_id="s1")
+            await channel.send_delta("c", "y", stream_id="s1", stream_end=True)
+        self.assertEqual(buf.getvalue(), "Hey\n")
+
+    async def test_send_delta_stream_ids_isolated(self):
+        channel, _ = self._make_channel()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            await channel.send_delta("c", "a", stream_id="s1")
+            await channel.send_delta("c", "b", stream_id="s2")
+            await channel.send_delta("c", "", stream_id="s2", stream_end=True)
+            await channel.send_delta("c", "", stream_id="s1", stream_end=True)
+        self.assertEqual(buf.getvalue(), "b\na\n")
+
+    async def test_exit_stops_immediately(self):
+        channel, bus = self._make_channel()
+        with mock.patch("step20.channels.cli.ainput", side_effect=["/exit"]):
+            await channel.start()
+        self.assertTrue(bus.inbound.empty())
+        self.assertFalse(channel.is_running)
+
+    async def test_empty_input_skipped(self):
+        channel, bus = self._make_channel()
+        with mock.patch("step20.channels.cli.ainput", side_effect=["", "", "/exit"]):
+            await channel.start()
+        self.assertTrue(bus.inbound.empty())
+
+    async def test_on_command_consumed(self):
+        channel, bus = self._make_channel()
+        calls = []
+
+        async def handler(text):
+            calls.append(text)
+            return text.startswith("/")
+
+        channel.on_command = handler
+        got = []
+        with mock.patch("step20.channels.cli.ainput", side_effect=["/dream", "hello", "/exit"]):
+            async def responder():
+                msg = await bus.consume_inbound()
+                got.append(msg)
+                await channel.send(OutboundMessage(content="ok", metadata={}))
+            resp_task = asyncio.create_task(responder())
+            await channel.start()
+            await resp_task
+        self.assertEqual(calls, ["/dream", "hello"])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].content, "hello")
+
+    def test_default_config(self):
+        cfg = CliChannel.default_config()
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["allow_from"], ["*"])
+        self.assertTrue(cfg["streaming"])
+
+
+class _RecordingChannel(BaseChannel):
+    name = "rec"
+
+    def __init__(self, config=None, bus=None, pairing=None):
+        super().__init__(config, bus, pairing)
+        self.sent: list[OutboundMessage] = []
+        self.deltas: list[str] = []
+        self.stream_ends: list[str] = []
+        self.started = False
+        self.stopped = False
+
+    async def start(self):
+        self._running = True
+        self.started = True
+
+    async def stop(self):
+        self._running = False
+        self.stopped = True
+
+    async def send(self, msg: OutboundMessage) -> None:
+        self.sent.append(msg)
+
+    async def send_delta(
+        self, chat_id, delta, metadata=None, *, stream_id=None,
+        stream_end=False, resuming=False,
+    ) -> None:
+        if stream_end:
+            self.stream_ends.append(delta)
+        else:
+            self.deltas.append(delta)
+
+
+class _FlakyChannel(_RecordingChannel):
+    def __init__(self, config=None, bus=None, pairing=None, fail_count=2):
+        super().__init__(config, bus, pairing)
+        self.fail_count = fail_count
+        self.attempts = 0
+
+    async def send(self, msg: OutboundMessage) -> None:
+        self.attempts += 1
+        if self.attempts <= self.fail_count:
+            raise RuntimeError("network")
+        self.sent.append(msg)
+
+
+class TestChannelManager(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.bus = MessageBus()
+        self.pairing = PairingStore(path=Path(tempfile.mkdtemp()) / "pairing.json")
+
+    def test_init_discovers_cli(self):
+        manager = ChannelManager(config={"cli": {}}, bus=self.bus, pairing=self.pairing)
+        self.assertIn("cli", manager.channels)
+        self.assertIsInstance(manager.channels["cli"], CliChannel)
+        self.assertEqual(manager.enabled_channels, ["cli"])
+
+    def test_default_enabled_without_config(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        self.assertIn("cli", manager.channels)
+
+    def test_disabled_channel_skipped(self):
+        manager = ChannelManager(config={"cli": {"enabled": False}}, bus=self.bus, pairing=self.pairing)
+        self.assertEqual(manager.channels, {})
+
+    def test_unknown_channel_skipped(self):
+        manager = ChannelManager(
+            config={"nope": {}, "cli": {"enabled": False}},
+            bus=self.bus, pairing=self.pairing,
+        )
+        self.assertEqual(manager.channels, {})
+
+    def test_section_applied(self):
+        manager = ChannelManager(
+            config={"cli": {"streaming": False, "allow_from": ["alice"]}},
+            bus=self.bus, pairing=self.pairing,
+        )
+        ch = manager.channels["cli"]
+        self.assertFalse(ch.config.get("streaming"))
+        self.assertEqual(ch.config.get("allow_from"), ["alice"])
+        self.assertFalse(ch.supports_streaming)
+
+    def test_on_command_wired(self):
+        def handler(text):
+            return False
+        manager = ChannelManager(config={"cli": {}}, on_command=handler)
+        self.assertIs(manager.channels["cli"].on_command, handler)
+
+    def test_get_status(self):
+        manager = ChannelManager(config={"cli": {}}, bus=self.bus, pairing=self.pairing)
+        status = manager.get_status()
+        self.assertTrue(status["cli"]["enabled"])
+        self.assertFalse(status["cli"]["running"])
+
+    def test_get_channel_unknown(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        self.assertIsNone(manager.get_channel("nope"))
+
+    async def test_dispatch_routes_plain_message(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        rec = _RecordingChannel({}, self.bus, self.pairing)
+        manager.channels = {"cli": rec}
+        dispatch = asyncio.create_task(manager._dispatch_outbound())
+        await self.bus.publish_outbound(OutboundMessage(channel="cli", chat_id="c", content="hi"))
+        await asyncio.sleep(0.05)
+        dispatch.cancel()
+        await dispatch
+        self.assertTrue(dispatch.done())
+        self.assertEqual([m.content for m in rec.sent], ["hi"])
+
+    async def test_dispatch_unknown_channel_no_crash(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        rec = _RecordingChannel({}, self.bus, self.pairing)
+        manager.channels = {"cli": rec}
+        dispatch = asyncio.create_task(manager._dispatch_outbound())
+        await self.bus.publish_outbound(OutboundMessage(channel="nope", content="hi"))
+        await asyncio.sleep(0.05)
+        dispatch.cancel()
+        await dispatch
+        self.assertTrue(dispatch.done())
+        self.assertEqual(rec.sent, [])
+
+    async def test_dispatch_stream_delta_mapping(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        rec = _RecordingChannel({}, self.bus, self.pairing)
+        manager.channels = {"cli": rec}
+        dispatch = asyncio.create_task(manager._dispatch_outbound())
+        await self.bus.publish_outbound(StreamDeltaEvent(content="hel", channel="cli", chat_id="c"))
+        await self.bus.publish_outbound(StreamDeltaEvent(content="lo", channel="cli", chat_id="c"))
+        await self.bus.publish_outbound(StreamDeltaEvent(content="", channel="cli", chat_id="c", finished=True))
+        await asyncio.sleep(0.05)
+        dispatch.cancel()
+        await dispatch
+        self.assertTrue(dispatch.done())
+        self.assertEqual(rec.deltas, ["hel", "lo"])
+        self.assertEqual(rec.stream_ends, [""])
+        self.assertEqual(rec.sent, [])
+
+    async def test_send_with_retry_success(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        flaky = _FlakyChannel({}, self.bus, self.pairing, fail_count=2)
+        with mock.patch("step20.manager._SEND_RETRY_DELAYS", (0.01, 0.02)):
+            await manager._send_with_retry(flaky, OutboundMessage(channel="rec", content="x"))
+        self.assertEqual(flaky.attempts, 3)
+        self.assertEqual(len(flaky.sent), 1)
+
+    async def test_send_with_retry_exhausted(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        flaky = _FlakyChannel({}, self.bus, self.pairing, fail_count=999)
+        with mock.patch("step20.manager._SEND_RETRY_DELAYS", (0.01, 0.02)):
+            await manager._send_with_retry(flaky, OutboundMessage(channel="rec", content="x"))
+        self.assertEqual(flaky.attempts, 3)
+        self.assertEqual(flaky.sent, [])
+
+    async def test_start_all_and_stop_all(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        rec = _RecordingChannel({}, self.bus, self.pairing)
+        manager.channels = {"rec": rec}
+        await manager.start_all()
+        self.assertTrue(rec.started)
+        self.assertTrue(rec.is_running)
+        await manager.stop_all()
+        self.assertTrue(rec.stopped)
+        self.assertTrue(manager._dispatch_task.done())
+
+    async def test_start_all_no_channels(self):
+        manager = ChannelManager(config={"cli": {"enabled": False}}, bus=self.bus, pairing=self.pairing)
+        await manager.start_all()
+        self.assertIsNone(manager._dispatch_task)
+
+    async def test_stop_all_idempotent(self):
+        manager = ChannelManager(config={}, bus=self.bus, pairing=self.pairing)
+        rec = _RecordingChannel({}, self.bus, self.pairing)
+        manager.channels = {"rec": rec}
+        await manager.stop_all()
+        self.assertTrue(rec.stopped)
+
+
+class TestStep20Integration(unittest.IsolatedAsyncioTestCase):
+    def _make_loop(self, tmp, bus):
+        provider = _MockProvider()
+        registry = _MockToolRegistry()
+        sessions = SessionManager(workspace=tmp)
+        return sessions, AgentLoop(
+            bus=bus, provider=provider, registry=registry,
+            session_manager=sessions,
+            context_builder=ContextBuilder(workspace="."),
+            memory=MemoryStore(workspace=tmp),
+            identity="You are a test bot.", replay_budget=10000,
+        )
+
+    async def test_end_to_end_cli_turn(self):
+        tmp = tempfile.mkdtemp()
+        bus = MessageBus()
+        sessions, loop = self._make_loop(tmp, bus)
+        channel = CliChannel({"allow_from": ["*"], "streaming": True}, bus, chat_id="sess1")
+        manager = ChannelManager(
+            config={}, bus=bus,
+            pairing=PairingStore(path=Path(tmp) / "pairing.json"),
+        )
+        manager.channels = {"cli": channel}
+        buf = io.StringIO()
+        loop_task = asyncio.create_task(loop.run())
+        with mock.patch("step20.channels.cli.ainput", side_effect=["hello", "/exit"]), \
+                redirect_stdout(buf):
+            await manager.start_all()
+        loop.stop()
+        loop_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await loop_task
+        session = sessions.get_or_create("sess1")
+        self.assertGreater(len(session.messages), 0)
+        self.assertEqual(session.messages[-1]["role"], "assistant")
+        self.assertIn("Summary", buf.getvalue())
+
+    async def test_pairing_denied_dm_end_to_end(self):
+        tmp = tempfile.mkdtemp()
+        bus = MessageBus()
+        sessions, loop = self._make_loop(tmp, bus)
+        store = PairingStore(path=Path(tmp) / "pairing.json")
+
+        class _PairingEchoChannel(BaseChannel):
+            name = "echo"
+
+            def __init__(self, config=None, bus=None, pairing=None):
+                super().__init__(config, bus, pairing)
+                self.sent = []
+
+            async def start(self):
+                self._running = True
+
+            async def stop(self):
+                self._running = False
+
+            async def send(self, msg):
+                self.sent.append(msg)
+
+        channel = _PairingEchoChannel({}, bus, store)
+        manager = ChannelManager(config={}, bus=bus, pairing=store)
+        manager.channels = {"echo": channel}
+        loop_task = asyncio.create_task(loop.run())
+        await channel._handle_message("stranger", "chat1", "hi", is_dm=True)
+        self.assertEqual(len(channel.sent), 1)
+        code = channel.sent[0].metadata.get(PAIRING_CODE_META_KEY)
+        self.assertIsNotNone(code)
+        self.assertFalse(bus.inbound.qsize())
+        result = store.approve_code(code)
+        self.assertEqual(result, ("echo", "stranger"))
+        await channel._handle_message("stranger", "chat1", "hello", is_dm=True)
+        resp = await asyncio.wait_for(_consume_final_response(bus), timeout=2)
+        self.assertIsNotNone(resp.content)
+        loop.stop()
+        loop_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await loop_task
+
+    async def test_on_command_end_to_end(self):
+        tmp = tempfile.mkdtemp()
+        bus = MessageBus()
+        sessions, loop = self._make_loop(tmp, bus)
+        channel = CliChannel({"allow_from": ["*"]}, bus, chat_id="sess1")
+        manager = ChannelManager(
+            config={}, bus=bus,
+            pairing=PairingStore(path=Path(tmp) / "pairing.json"),
+        )
+        manager.channels = {"cli": channel}
+        events = []
+
+        async def on_command(text):
+            events.append(text)
+            if text == "/new":
+                sessions.invalidate("sess1")
+                p = sessions._get_session_path("sess1")
+                if p.exists():
+                    p.unlink()
+                return True
+            return False
+
+        channel.on_command = on_command
+        loop_task = asyncio.create_task(loop.run())
+        with mock.patch("step20.channels.cli.ainput", side_effect=["/new", "hi", "/exit"]):
+            await manager.start_all()
+        self.assertEqual(events, ["/new", "hi"])
+        session = sessions.get_or_create("sess1")
+        self.assertGreater(len(session.messages), 0)
+        self.assertEqual(session.messages[-1]["role"], "assistant")
+        loop.stop()
+        loop_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await loop_task
+
+
+if __name__ == "__main__":
+    unittest.main()
