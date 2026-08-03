@@ -13,89 +13,80 @@
 | 14 | Governance 增强 | governance.py + helpers.py | 104 |
 | 15 | Consolidation + Dream + MemoryStore | memory.py + consolidation.py | 128 |
 | 16 | Subagents + Sustained Goals | subagent.py + long_task.py + goal_state.py | 156 |
+| 17a | Governance & Tool Execution Safety | runner.py + governance.py | 206 |
+| 17b | Content Recovery & Continuation Control | runner.py + loop.py | 256 |
+| 18 | ToolLoader & Tool System Upgrade | loader.py + tool.py + context.py | — |
+| 19 | Session System Upgrade | session.py + autocompact.py | — |
+| 20 | Channel Framework | channel.py + pairing.py + manager.py + channels/ | 318 |
 
 ---
 
-## Step 17a — Governance & Tool Execution Safety
+## Step 21 — CommandRouter & COMMAND 状态
 
-**主题：** AgentRunner 可靠性增强（基础安全层）
-
-| 改进 | 行数 |
-|------|------|
-| ContextGovernor 默认集成 | ~20 |
-| 并发工具执行 | ~50 |
-| 工具结果归一化 | ~20 |
-| 格式错误工具调用处理 | ~20 |
-| LLM 超时 | ~15 |
-| 测试 | ~50 |
-
-**目标测试数：** ~206
-
----
-
-## Step 17b — Content Recovery & Continuation Control
-
-**主题：** AgentRunner 完成度保障（响应质量）
-
-| 改进 | 行数 |
-|------|------|
-| 空内容重试 | ~25 |
-| Token 耗尽续行 | ~20 |
-| Goal 续行封顶 | ~15 |
-| 注入周期控制 + 合并 | ~30 |
-| 测试 | ~50 |
-
-**目标测试数：** ~256
-
----
-
-## Step 18 — ToolLoader & Tool System Upgrade
-
-**主题：** 工具系统升级为 nanobot 风格
+**主题：** 对齐 nanobot loop 8 态状态机（`RESTORE→COMPACT→COMMAND→BUILD→RUN→SAVE→RESPOND→DONE`）
 
 | 改进 | 说明 |
 |------|------|
-| ToolLoader | `pkgutil.iter_modules` + `entry_points` 自动发现 |
-| 安全边界 | SSRF 保护、workspace 违规检测 |
-| ContextVar 状态 | `RequestContext` / `ToolContext` ContextVar 注入 |
-| RuntimeContextProvider | 工具向 system prompt 注入运行时上下文块 |
-| 参数校验 | `prepare_call()` → JSON Schema 校验 + 类型强转 |
-| `Tool` 基类增强 | `read_only`, `exclusive`, `concurrency_safe`, `cast_params`, `validate_params` |
+| `command/router.py` | `CommandRouter` 三档路由（priority/exact/prefix）+ `normalize_command_text` + `CommandContext` |
+| `command/builtin.py` | `/dream` `/history` `/new` `/pairing`（接 PairingStore）`/help` |
+| `loop.py` | 加 `COMMAND` 态，命令短路 `shortcut→DONE` |
+| `main.py` | 删除 on_command 闭包（`/exit` 保留 CliChannel） |
 
-**导入：** 从 step17b fork，import `step17b.` → `step18.`
+**导入：** 从 step20 fork，import `step20.` → `step21.`
 
 ---
 
-## Step 19 — Session System Upgrade
+## Step 22 — Providers Registry & Factory + Fallback
 
-**主题：** 会话管理升级为 nanobot 风格
+**主题：** provider 注册/匹配/异常式回退（nanobot providers/registry + factory + fallback_provider 最小集）
 
 | 改进 | 说明 |
 |------|------|
-| base64url 文件名编码 | 替代 `:` → `_` 转义 |
-| 两级缓存 | `OrderedDict` (128 hot) + `WeakValueDictionary` overflow |
-| AutoCompact | TTL 驱动的空闲会话压缩 |
-| 文件上限强制 | `enforce_file_cap(2000)` |
-| Pending user turn restore | 崩溃恢复 |
-| Fork session | `fork_session_before_user_index()` |
+| `providers/registry.py` | `ProviderSpec` dataclass + ~6 条目（openai/deepseek/dashscope/openrouter/ollama/custom）+ `find_by_name` |
+| `providers/factory.py` | `make_provider(settings)`，模型名关键词匹配 |
+| `providers/fallback_provider.py` | 异常捕获式逐级回退（复用 `_StreamGuard` 已发 delta 不重试） |
 
-**导入：** 从 step18 fork，import `step18.` → `step19.`
+**导入：** 从 step21 fork，import `step21.` → `step22.`
 
 ---
 
-## Step 20 — Channel Framework
+## Step 23 — Pydantic 配置系统
 
-**主题：** 通道框架
+**主题：** nanobot config/schema + loader 最小集（`NANOBOT_` env 前缀 + JSON 文件）
 
 | 改进 | 说明 |
 |------|------|
-| BaseChannel ABC | `start()`, `stop()`, `send()`, `_handle_message()` |
-| ChannelManager | 发现、初始化、启动/停止，路由 outbound 消息 |
-| Permission system | `is_allowed()`, pairing, `allowFrom` |
-| Stream delivery | `send_delta()` streaming 支持 |
-| CLI channel | 第一个实现 |
+| `config/schema.py` | Config（agents.defaults / providers / channels / model_presets） |
+| `config/loader.py` | 配置文件加载 + env 解析 |
+| 接入 | 消除 main.py 硬编码常量；工厂改接 Config；`Tool.config_cls()` 落地 |
 
-**导入：** 从 step19 fork，import `step19.` → `step20.`
+**导入：** 从 step22 fork，import `step22.` → `step23.`
+
+---
+
+## Step 24 — Gateway & HTTP API
+
+**主题：** OpenAI 兼容 HTTP API（nanobot api/server.py 最小集）
+
+| 改进 | 说明 |
+|------|------|
+| `api/server.py` | `POST /v1/chat/completions`（SSE 流式）+ `GET /v1/models` + `GET /health` |
+| 鉴权 | Authorization 中间件；请求入 bus → loop → outbound 转 SSE |
+
+**导入：** 从 step23 fork，import `step23.` → `step24.`
+
+---
+
+## Step 25 — MCP Integration
+
+**主题：** Model Context Protocol 工具集成（nanobot agent/tools/mcp.py 最小集）
+
+| 改进 | 说明 |
+|------|------|
+| `agent/tools/mcp.py` | stdio / streamable HTTP 客户端，`mcp_<server>_<tool>` 注册 |
+| 配置 | `tools.mcp_servers`（接 step23 config）；测试全部 mock |
+
+**导入：** 从 step24 fork，import `step24.` → `step25.`
 
 ---
 
@@ -103,10 +94,7 @@
 
 | Step | 主题 | 说明 |
 |------|------|------|
-| 21 | Providers Registry & Factory | nanobot 风格的 provider 注册/匹配/fallback |
-| 22 | Configuration | Pydantic config schema |
-| 23 | Gateway & HTTP API | WebSocket gateway + OpenAI-compatible HTTP API |
-| 24 | MCP Integration | Model Context Protocol tools |
+| 26+ | WebUI / Skills / Triggers / entry_points 插件发现 | 视需求规划 |
 
 ---
 
