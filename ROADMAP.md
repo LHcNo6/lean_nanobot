@@ -21,6 +21,7 @@
 | 21 | CommandRouter & COMMAND 状态 | command/router.py + builtin.py + loop.py | 341 |
 | 22 | Providers Registry & Factory + Fallback | providers/registry.py + factory.py + fallback_provider.py + llm.py | 376 |
 | 23 | Mid-turn Injection 打通 + Subagent 系统消息通道 | loop.py + runner.py + context.py + tools/spawn.py | 388 |
+| 24 | Session 持久化净化 + Checkpoint 恢复 | loop.py + runner.py + tests/test_persistence.py | 411 |
 
 ---
 
@@ -66,17 +67,18 @@
 
 ---
 
-## Step 24 — Session 持久化净化 + Checkpoint 恢复（A4 + A5）
+## Step 24 — Session 持久化净化 + Checkpoint 恢复（A4 + A5）✅ 已完成（411 tests）
 
 **主题：** 防止畸形消息污染历史；崩溃后可恢复进行中的 turn
 
 | 改进 | 说明 |
 |------|------|
-| `loop.py:_save_turn` | 丢弃空 assistant、校验并丢弃孤儿 tool result、`max_tool_result_chars` 截断、多模态块净化、latency |
-| `loop.py` | `_set/_restore_runtime_checkpoint`（metadata 持久化 + overlap 去重 + pending call 补 interrupted 结果） |
-| `runner.py` | `checkpoint_callback` 挂到 `_emit_checkpoint` 语义 |
+| `loop.py:_save_turn` | 丢弃空 assistant、校验并丢弃孤儿 tool result、`max_tool_result_chars`（默认 16000）截断、list 块净化（空补占位）、latency 打在最后 assistant 消息 |
+| `loop.py` | `_set/_restore/_clear_runtime_checkpoint`（metadata 持久化 + `_checkpoint_message_key` overlap 去重 + pending call 补 interrupted 结果）；`_state_restore`/`_process_system_message` 恢复点；system 路径 skip 改为 `len(initial_messages)`（修正旧实现丢 subagent 轮末回复） |
+| `runner.py` | `AgentRunSpec.checkpoint_callback` + `_emit_checkpoint`，`awaiting_tools`/`tools_completed`/`final_response`（含注入续跑路径）三语义发射点 |
+| 测试 | `tests/test_persistence.py`（pytest，23 个）：净化 10 + checkpoint 7 + runner 发射 4 + 集成 2，全部 mock provider |
 
-**导入：** 从 step23 fork，import `step23.` → `step24.`
+**导入：** 从 step23 fork，import `step23.` → `step24.`；测试改为 pytest（新增），回归仍走 `python -m unittest step24.test`（388）
 
 ---
 
