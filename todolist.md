@@ -31,7 +31,7 @@
 
 | ID | 缺口 | 现状（step21） | nanobot 参考 | 归属步骤 | 状态 |
 |----|------|---------------|--------------|---------|------|
-| H1 | **Config 配置系统**：schema + loader（`NANOBOT__` env、`${VAR}` 替换、迁移）；`agents.defaults`（fallback_models / session_ttl_minutes / consolidation_ratio / disabled_skills / tools.* / channels.* / gateway.*） | main.py 硬编码常量 | `config/schema.py`、`config/loader.py` | step25 | ⬜ |
+| H1 | **Config 配置系统**：schema + loader（`NANOBOT__` env、`${VAR}` 替换、迁移）；`agents.defaults`（fallback_models / session_ttl_minutes / consolidation_ratio / disabled_skills / tools.* / channels.* / gateway.*） | 已落地（step25）：schema + loader + 工厂双路分发 + `AgentLoop.from_config` + `Tool.config_cls()` 落地；tools.* 为通用 extra 映射（类型化待 step30） | `config/schema.py`、`config/loader.py` | step25 | ✅ |
 | H2 | **Providers Registry / Factory / Fallback / Snapshot**：ProviderSpec 自动探测、FallbackProvider 逐级回退、ProviderSnapshot（signature 热刷新） | registry(6 条目)+factory+异常式 FallbackProvider+Snapshot 已落地；自动探测/热刷新待 step25 | `providers/registry.py`、`providers/factory.py`、`providers/fallback_provider.py` | step22 / step25 | ✅(异常式) |
 | H3 | **装配 harness（from_config）**：`AgentLoop.from_config` 统一装配；outbound→session 镜像（`_deliver_to_channel`）；MessageTool 回调桥接；TokenUsageHook；健康检查 | main.py 内联硬编码装配 | `cli/commands.py:_start_gateway_runtime` | step26 起步 | ⬜ |
 | H4 | **事件层**：typed outbound events（Progress / RetryWait / StreamEnd / StreamedResponse / TurnEnd / GoalStatus / SessionUpdated / RuntimeModelUpdated）+ 独立 RuntimeEventBus（turn started/completed、run status） | 2 队列 + 3 事件类型 | `bus/outbound_events.py`、`bus/runtime_events.py`、`bus/progress.py` | step26 | ⬜ |

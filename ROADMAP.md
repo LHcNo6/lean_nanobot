@@ -22,6 +22,7 @@
 | 22 | Providers Registry & Factory + Fallback | providers/registry.py + factory.py + fallback_provider.py + llm.py | 376 |
 | 23 | Mid-turn Injection 打通 + Subagent 系统消息通道 | loop.py + runner.py + context.py + tools/spawn.py | 388 |
 | 24 | Session 持久化净化 + Checkpoint 恢复 | loop.py + runner.py + tests/test_persistence.py | 411 |
+| 25 | Pydantic 配置系统 | config/schema.py + config/loader.py + providers/factory.py | 451 |
 
 ---
 
@@ -82,17 +83,18 @@
 
 ---
 
-## Step 25 — Pydantic 配置系统（H1）
+## Step 25 — Pydantic 配置系统（H1）✅ 已完成（451 tests）
 
 **主题：** nanobot config/schema + loader 最小集（`NANOBOT_` env 前缀 + JSON 文件）
 
 | 改进 | 说明 |
 |------|------|
-| `config/schema.py` | Config（agents.defaults / providers / channels / model_presets） |
-| `config/loader.py` | 配置文件加载 + `${VAR}`/env 解析 + 迁移 |
-| 接入 | 消除 main.py 硬编码常量；工厂改接 Config；`Tool.config_cls()` 落地；`AgentLoop.from_config` 装配雏形 |
+| `config/schema.py` | `Base`（camel/snake 双写）+ `Config`（agents.defaults / providers / channels / model_presets）+ `resolve_preset` / `get_provider*` 查询（走 step22 registry） |
+| `config/loader.py` | `load_config`/`save_config`/`${VAR}` 替换/迁移；手写 `NANOBOT_` env 解析（`__` 嵌套），文件优先、env 补缺（不用 pydantic-settings） |
+| 接入 | main.py 删全部硬编码；factory 双路分发（Config / ProviderSettings，388 回归零改动）；`Tool.config_cls()` 落地（`resolve_tool_config` + EchoTool 演示）；`AgentLoop.from_config` 装配雏形；ToolContext 拿到真实 config/workspace |
+| 测试 | `tests/test_config.py`（pytest，40 个）：schema/loader/工厂 Config 路径/from_config/tool 配置，全部构造数据 |
 
-**导入：** 从 step24 fork，import `step24.` → `step25.`
+**导入：** 从 step24 fork，import `step24.` → `step25.`；回归 `python -m unittest step25.test`（388）+ `pytest step25/tests`（63）
 
 ---
 
