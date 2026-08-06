@@ -20,6 +20,7 @@
 | 20 | Channel Framework | channel.py + pairing.py + manager.py + channels/ | 318 |
 | 21 | CommandRouter & COMMAND 状态 | command/router.py + builtin.py + loop.py | 341 |
 | 22 | Providers Registry & Factory + Fallback | providers/registry.py + factory.py + fallback_provider.py + llm.py | 376 |
+| 23 | Mid-turn Injection 打通 + Subagent 系统消息通道 | loop.py + runner.py + context.py + tools/spawn.py | 388 |
 
 ---
 
@@ -46,7 +47,7 @@
 
 ---
 
-## Step 23 — Mid-turn Injection 打通 + Subagent 系统消息通道（A2 + A3 + A6）
+## Step 23 — Mid-turn Injection 打通 + Subagent 系统消息通道（A2 + A3 + A6）✅ 已完成（388 tests）
 
 **主题：** 修复"注入死代码"——subagent 回包应在 turn 内注入而非排队成独立 turn
 
@@ -56,6 +57,10 @@
 | `runner.py` | `_has_injection_content`、`_MAX_INJECTIONS_PER_TURN` 参数、`allow_goal_continue` |
 | `loop.py` | `channel=="system"` 分支：subagent 回包 `current_role="assistant"`、按 `subagent_task_id` 去重、前置持久化 |
 | `TurnContext` | 补 turn_id / runtime / on_progress / on_stream / on_stream_end / pending_queue 字段 |
+
+**已落地：** `_dispatch` 重写（identity 弹栈 + re-publish）、`_drain_pending` 阻塞注入、
+`_process_system_message` 去重持久化标记、`build_messages(current_role)` 角色交替 merge、
+`SpawnTool` 透传 session_key。测试 388 全绿（详见 `step23/step23.md`）。
 
 **导入：** 从 step22 fork，import `step22.` → `step23.`
 
