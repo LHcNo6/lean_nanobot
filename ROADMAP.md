@@ -98,7 +98,7 @@
 
 ---
 
-## Step 26 — 事件层：typed outbound events + RuntimeEventBus（H4 + H3）
+## Step 26 — 事件层：typed outbound events + RuntimeEventBus（H4 + H3）✅ 已完成（388 tests + pytest 103）
 
 **主题：** 为真实通道铺路——progress / retry_wait / stream end / turn 生命周期事件
 
@@ -113,15 +113,15 @@
 
 ---
 
-## Step 27 — Skills 加载器（A11）
+## Step 27 — Skills 加载器（A11）✅ 已完成（388 + pytest 142）
 
 **主题：** SKILL.md frontmatter + 可用性过滤 + 渐进加载 + 参考注入
 
 | 改进 | 说明 |
 |------|------|
-| `skills/loader.py` | SKILL.md YAML frontmatter（requires: bins/env）、workspace 覆盖、disabled_skills |
-| `context.py` | ContextBuilder 注入 skills 参考块 |
-| 测试 | 全部构造数据，不依赖真实环境 |
+| `skills/loader.py` | `SkillsLoader`（workspace 覆盖内置 / `requires: bins/env` 可用性过滤 / `disabled_skills` / frontmatter 剥离 / `build_skills_summary` 渐进摘要 / `get_always_skills` 全量注入） |
+| `context.py` | ContextBuilder 注入 `# Active Skills`（always + `skill_names` 显式）+ `# Skills` 摘要块；`from_config` 贯通 `disabled_skills` |
+| 测试 | `tests/test_skills.py`（pytest，39 个，全构造数据）；回归 388 unittest + 103 pytest 全绿 |
 
 **导入：** 从 step26 fork，import `step26.` → `step27.`
 
