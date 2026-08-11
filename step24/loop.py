@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 from step24.bus import MessageBus
 from step24.autocompact import AutoCompact

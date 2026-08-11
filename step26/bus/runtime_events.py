@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RuntimeEventContext:
-    """Routing context common to turn-scoped runtime events."""
+    """Routing context common to turn-scoped runtime events.
+    轮次范围内的运行时事件所共用的路由上下文。"""
 
     channel: str
     chat_id: str
@@ -38,14 +39,16 @@ class RuntimeEventContext:
 
 @dataclass(frozen=True)
 class SessionTurnStarted:
-    """A user/system turn has loaded its session and is about to build context."""
+    """A user/system turn has loaded its session and is about to build context.
+    一个用户/系统轮次已加载其会话，即将构建上下文。"""
 
     context: RuntimeEventContext
 
 
 @dataclass(frozen=True)
 class TurnRunStatusChanged:
-    """Visible run status changed for a turn."""
+    """Visible run status changed for a turn.
+    某一轮次的可见运行状态已发生变化。"""
 
     context: RuntimeEventContext
     status: str
@@ -54,7 +57,8 @@ class TurnRunStatusChanged:
 
 @dataclass(frozen=True)
 class TurnCompleted:
-    """A turn has delivered its final user-visible response."""
+    """A turn has delivered its final user-visible response.
+    某一轮次已交付其最终的用户可见响应。"""
 
     context: RuntimeEventContext
     latency_ms: int | None = None

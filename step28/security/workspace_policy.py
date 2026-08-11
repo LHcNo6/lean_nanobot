@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+#这是一个硬性策略边界，而非临时性故障，请勿使用 shell 技巧或替代工具进行重试如果该资源确实必不可少，请询问用户如何继续。
 WORKSPACE_BOUNDARY_NOTE = (
     " (this is a hard policy boundary, not a transient failure; "
     "do not retry with shell tricks or alternative tools, and ask "
