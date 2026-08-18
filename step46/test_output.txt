@@ -1,0 +1,202 @@
+﻿[echo] Sent pairing code AV6K-DMG3 to sender stranger in chat chat1
+[echo] Access denied for sender stranger. Add them to allowFrom list in config to grant access.
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] Unknown channel: nope
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+[manager] Send to rec failed (attempt 1/3): RuntimeError, retrying in 0.01s
+[manager] Send to rec failed (attempt 2/3): RuntimeError, retrying in 0.02s
+[manager] Failed to send to rec after 3 attempts: RuntimeError: network
+[manager] CLI channel enabled
+[manager] Send to rec failed (attempt 1/3): RuntimeError, retrying in 0.01s
+[manager] Send to rec failed (attempt 2/3): RuntimeError, retrying in 0.02s
+[manager] CLI channel enabled
+[manager] No channels enabled
+[manager] CLI channel enabled
+
+[?]
+ok
+  tokens: ?
+
+
+[stop]
+reply
+  tokens: ?
+
+python : .......F....................................................................................................F.
+.......................F.....primary model failed, trying fallbacks: http 500
+At line:1 char:13422
++ ... NPATH="D:\CODE\nano\learn_nano"; python -m unittest test 2>&1 | Out-F ...
++                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (.......F..........backs: http 500:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+fallback 'fallback-a' also failed: http 502
+fallback 'fallback-b' also failed: http 502
+all fallbacks failed; re-raising primary error
+..primary model failed, trying fallbacks: http 500
+primary model failed, trying fallbacks: http 500
+primary model circuit open after 3 consecutive failures
+primary model failed, trying fallbacks: http 500
+.primary model failed, trying fallbacks: http 500
+..primary model failed, trying fallbacks: http 500
+..primary streamed content before failing; skipping failover: http 503
+.LLM transient error (attempt 1/3), retrying in 0.6s: error calling llm: 
+LLM transient error (attempt 2/3), retrying in 1.9s: error calling llm: 
+LLM transient error (attempt 3/3), retrying in 4.4s: error calling llm: 
+LLM request failed after 3 retries, giving up: error calling llm: 
+primary model failed, trying fallbacks: 
+............................................................Hook _ErrorHook.before_iteration failed: hook error
+Traceback (most recent call last):
+  File "D:\CODE\nano\learn_nano\step46\hook.py", line 207, in _for_each_hook_safe
+    await getattr(hook, method_name)(*args, **kwargs)
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 176, in before_iteration
+    raise RuntimeError("hook error")
+RuntimeError: hook error
+........injection_callback returned 10 messages, capping to 3 (7 dropped)
+[pairing] Corrupted pairing store C:\Users\LI\AppData\Local\Temp\tmp16l9sgxc\pairing.json, resetting
+........................EF............................................................................injection_callbac
+k failed
+Traceback (most recent call last):
+  File "D:\CODE\nano\learn_nano\step46\runner.py", line 679, in _drain_injections
+    if accepts_limit else await spec.injection_callback()
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 1634, in callback
+    raise RuntimeError("boom")
+RuntimeError: boom
+[manager] CLI channel enabled
+[manager] CLI channel enabled
+Summary: user asked about weather, assistant provided forecast.
+
+[stop]
+Summary: user asked about weather, assistant provided forecast.
+  tokens: 0+0
+
+[manager] CLI channel enabled
+[echo] Sent pairing code DZAC-TUYH to sender stranger in chat chat1
+.......................................................................................................................
+.........
+======================================================================
+ERROR: test_all_invalid_twice_then_fallback (test.TestMalformedToolCallRecovery.test_all_invalid_twice_then_fallback)
+After repeated malformed calls, runner eventually produces a non-tool response.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 2908, in test_all_invalid_twice_then_fallback
+    result = await AgentRunner().run(spec)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\CODE\nano\learn_nano\step46\runner.py", line 193, in run
+    result = await self._run_loop(
+             ^^^^^^^^^^^^^^^^^^^^^
+        spec, messages, tools_used, total_usage, hook,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\CODE\nano\learn_nano\step46\runner.py", line 794, in _run_loop
+    response = await self._request_model(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+        spec, messages_for_model, tools_defs, hook, iter_ctx,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\CODE\nano\learn_nano\step46\runner.py", line 354, in _request_model
+    return await self._request_model(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+        spec, retry_messages, tools_defs, hook, iter_ctx, malformed_retry=True,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\CODE\nano\learn_nano\step46\runner.py", line 363, in _request_model
+    return await self._request_no_tools(spec, fallback_messages)
+                 ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: AgentRunner._request_no_tools() missing 2 required positional arguments: 'hook' and 'iter_ctx'
+
+======================================================================
+FAIL: test_state_compact_with_summary (test.TestAgentLoopStateHandlers.test_state_compact_with_summary)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 804, in test_state_compact_with_summary
+    self.assertIsNotNone(ctx.summary)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+AssertionError: unexpectedly None
+
+======================================================================
+FAIL: test_exceed_retries_triggers_finalization_fallback (test.TestEmptyContentRetry.test_exceed_retries_triggers_final
+ization_fallback)
+After _MAX_EMPTY_RETRIES, finalization message is sent without tools.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 3137, in test_exceed_retries_triggers_finalization_fallback
+    self.assertIn(result.stop_reason, ("stop", "error"))
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'empty_final_response' not found in ('stop', 'error')
+
+======================================================================
+FAIL: test_error_with_injection_callback (test.TestErrorTermination.test_error_with_injection_callback)
+LLM error terminates without draining injections.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 3046, in test_error_with_injection_callback
+    self.assertEqual(injector.total_calls, 0)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 5 != 0
+
+======================================================================
+FAIL: test_invalid_name_dropped_and_retried (test.TestMalformedToolCallRecovery.test_invalid_name_dropped_and_retried)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\LI\AppData\Local\Doubao\User Data\sandbox_runtime\bases\08cf4f1e17b11ebb8f8367e5741f1eaf\python\Lib\as
+yncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "D:\CODE\nano\learn_nano\step46\test.py", line 2895, in test_invalid_name_dropped_and_retried
+    self.assertGreaterEqual(len(retry_msgs), 1)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 not greater than or equal to 1
+
+----------------------------------------------------------------------
+Ran 445 tests in 14.708s
+
+FAILED (failures=4, errors=1)
