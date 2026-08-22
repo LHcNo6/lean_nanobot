@@ -1,0 +1,70 @@
+﻿from __future__ import annotations
+
+import importlib
+import pkgutil
+from typing import Any
+
+from step104.tool import Tool, ToolRegistry
+
+_SKIP_MODULES = frozenset({
+    "base", "schema", "registry", "context", "loader", "config",
+    "file_state", "sandbox", "mcp", "__init__",
+})
+
+
+class ToolLoader:
+    def __init__(self, package: Any = None, *, test_classes: list[type[Tool]] | None = None):
+        if package is None:
+            import step104.tools as _pkg
+            package = _pkg
+        self._package = package
+        self._test_classes = test_classes
+        self._discovered: list[type[Tool]] | None = None
+
+    def discover(self) -> list[type[Tool]]:
+        if self._test_classes is not None:
+            return list(self._test_classes)
+        if self._discovered is not None:
+            return self._discovered
+        seen: set[int] = set()
+        results: list[type[Tool]] = []
+        for _importer, module_name, _ispkg in pkgutil.iter_modules(self._package.__path__):
+            if module_name.startswith("_") or module_name in _SKIP_MODULES:
+                continue
+            try:
+                module = importlib.import_module(f".{module_name}", self._package.__name__)
+            except Exception:
+                continue
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+                if (
+                    isinstance(attr, type)
+                    and issubclass(attr, Tool)
+                    and attr is not Tool
+                    and not attr_name.startswith("_")
+                    and not getattr(attr, "__abstractmethods__", None)
+                    and getattr(attr, "_plugin_discoverable", True)
+                    and id(attr) not in seen
+                ):
+                    seen.add(id(attr))
+                    results.append(attr)
+        results.sort(key=lambda cls: cls.__name__)
+        self._discovered = results
+        return results
+
+    def load(self, ctx: Any, registry: ToolRegistry, *, scope: str = "core") -> list[str]:
+        registered: list[str] = []
+        for tool_cls in self.discover():
+            try:
+                if scope not in getattr(tool_cls, "_scopes", {"core"}):
+                    continue
+                if not tool_cls.enabled(ctx):
+                    continue
+                tool = tool_cls.create(ctx)
+                if registry.has(tool.name):
+                    continue
+                registry.register(tool)
+                registered.append(tool.name)
+            except Exception:
+                continue
+        return registered
