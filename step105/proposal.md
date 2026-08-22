@@ -1,25 +1,29 @@
-# Step 100 Proposal: token 估算对齐 + unified_session + WeakValueDictionary
+# Step 105 Proposal: gitstore 模块
 
 ## 1. 问题背景
 
-Consolidator 当前用 `sum(estimate_message_tokens(m))` 逐个估算消息 token，未考虑系统提示、工具定义等开销，估算不准确。_locks 使用普通 dict 会无限增长。缺少 unified_session 参数。
+Dream 运行后记忆文件（SOUL.md / USER.md / MEMORY.md）的变更需要自动提交到 git，且 commit message 和 cursor 推进需要基于真实工作树差异而非 LLM 自报告。当前缺少 Git 操作封装层。nanobot 使用 dulwich 纯 Python 实现，本 step 使用 subprocess 调用 git 命令以保持接口兼容。
 
 ## 2. 目标
 
-1. `__init__` 新增 `unified_session: bool = False` 参数
-2. `_locks` 改用 `weakref.WeakValueDictionary[str, asyncio.Lock]`
-3. 新增 `estimate_session_prompt_tokens(session, runtime)` 方法，通过 `_build_messages` 构建完整 probe 后调用 `estimate_prompt_tokens_chain`
-4. `maybe_consolidate_by_tokens` 改用 `estimate_session_prompt_tokens`，返回 `(estimated, source)` 元组
+新增 `utils/gitstore.py` 模块，包含：
+1. `CommitInfo` 数据类（sha / message / timestamp）
+2. `GitStore` 类：`is_initialized`、`init`、`auto_commit`、`summarize_working_tree`
+3. 支持 tracked_files 配置，只监控指定文件变更
 
 ## 3. 非目标
 
-- 不修改 _build_messages 签名（后续 step）
-- 不修改 archive 方法（step99 已完成）
+- 不集成到 MemoryStore（step106 完成）
+- 不实现分支管理、远程推送、merge 等高级 git 操作
+- 不使用 dulwich（subprocess 方案，接口兼容）
 
 ## 4. 验收标准
 
-1. unified_session 参数可传入并存储
-2. _locks 为 WeakValueDictionary 类型
-3. estimate_session_prompt_tokens 返回 (int, str) 元组
-4. maybe_consolidate_by_tokens 使用新方法估算
-5. 现有测试全部通过
+1. `GitStore(workspace, tracked_files=[...])` 初始化正常
+2. `is_initialized()` 非 git 目录返回 False
+3. `init()` 执行 `git init` 并创建 tracked 文件（如不存在）
+4. `init()` 幂等（已初始化不重复执行）
+5. `auto_commit(message)` 无变更返回 None，有变更返回 commit SHA
+6. `summarize_working_tree(paths)` 返回结构化 diff 摘要
+7. 非 git 环境下 `summarize_working_tree` 返回空串
+8. 单元测试通过

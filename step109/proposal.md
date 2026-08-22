@@ -1,25 +1,29 @@
-# Step 100 Proposal: token 估算对齐 + unified_session + WeakValueDictionary
+# Step 109 Proposal: _format_messages + raw_archive 格式对齐
 
 ## 1. 问题背景
 
-Consolidator 当前用 `sum(estimate_message_tokens(m))` 逐个估算消息 token，未考虑系统提示、工具定义等开销，估算不准确。_locks 使用普通 dict 会无限增长。缺少 unified_session 参数。
+`MemoryStore._format_messages` 当前使用旧的多行格式（`[role]\ncontent\n[tool_calls: ...]`），与参考实现的单行格式（`[timestamp] ROLE [tools: ...]: content`）不一致。`raw_archive` 缺少消息计数前缀和降级 warning 日志，且未使用 `public_history_messages` 过滤内部标记。
 
 ## 2. 目标
 
-1. `__init__` 新增 `unified_session: bool = False` 参数
-2. `_locks` 改用 `weakref.WeakValueDictionary[str, asyncio.Lock]`
-3. 新增 `estimate_session_prompt_tokens(session, runtime)` 方法，通过 `_build_messages` 构建完整 probe 后调用 `estimate_prompt_tokens_chain`
-4. `maybe_consolidate_by_tokens` 改用 `estimate_session_prompt_tokens`，返回 `(estimated, source)` 元组
+1. `_format_messages` 改为参考实现格式：`[timestamp] ROLE [tools: ...]: content`，跳过无 content 消息
+2. `raw_archive` 使用 `public_history_messages` 过滤内部消息，格式为 `[RAW] N messages\n{formatted}`，并记录 `logger.warning`
+3. 保持与 Consolidator 的兼容性（Consolidator 调用 `MemoryStore._format_messages`）
 
 ## 3. 非目标
 
-- 不修改 _build_messages 签名（后续 step）
-- 不修改 archive 方法（step99 已完成）
+- 不修改 Consolidator 的归档逻辑
+- 不修改 append_history 的格式
+- 不修改 history.jsonl 的存储结构
 
 ## 4. 验收标准
 
-1. unified_session 参数可传入并存储
-2. _locks 为 WeakValueDictionary 类型
-3. estimate_session_prompt_tokens 返回 (int, str) 元组
-4. maybe_consolidate_by_tokens 使用新方法估算
-5. 现有测试全部通过
+1. `_format_messages` 输出格式为 `[timestamp] ROLE: content`
+2. 有 tools_used 时输出 `[tools: tool1, tool2]` 后缀
+3. 无 content 的消息被跳过
+4. 缺失 timestamp 时使用 `?`
+5. `raw_archive` 输出包含 `[RAW] N messages` 前缀
+6. `raw_archive` 使用 `public_history_messages` 过滤
+7. `raw_archive` 调用时记录 warning 日志
+8. `raw_archive` 空消息列表不报错
+9. 单元测试通过

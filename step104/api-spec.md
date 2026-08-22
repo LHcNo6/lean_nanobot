@@ -1,18 +1,24 @@
-# Step 100 API 契约
+# Step 104 API 契约
 
-## consolidation.py 变更
+## memory.py — MemoryStore 新增
 
-### Consolidator.__init__
-新增参数 `unified_session: bool = False`。
-
-### Consolidator._locks
-类型从 `dict[str, asyncio.Lock]` 改为 `weakref.WeakValueDictionary[str, asyncio.Lock]`。
-
-### Consolidator.estimate_session_prompt_tokens（新增）
+### dream_run_completed（静态方法）
 ```python
-def estimate_session_prompt_tokens(self, session, *, runtime) -> tuple[int, str]
+@staticmethod
+def dream_run_completed(resp: object | None) -> bool
 ```
-返回 (token_count, source)，source 为 "chain" 或 "fallback"。
+返回 True 当且仅当 `resp.metadata` 是 dict 且 `resp.metadata["_stop_reason"] == "completed"`。其他所有情况（None、无 metadata、非 dict、错误的 stop_reason）均返回 False。
 
-### maybe_consolidate_by_tokens（行为变更）
-改用 `estimate_session_prompt_tokens` 替代 `sum(estimate_message_tokens)`。
+### build_dream_commit_message（静态方法）
+```python
+@staticmethod
+def build_dream_commit_message(prefix: str, diff_body: str) -> str
+```
+- diff_body 为空（None/空串/纯空白）→ 返回纯 `prefix`
+- diff_body 非空 → 返回 `f"{prefix}\n\n{diff_body.strip()}"`
+
+## main.py — run_dream 行为变更
+
+Dream run 完成判断从无条件推进 cursor 改为：
+- `dream_run_completed(run_result)` 为 True → 推进 cursor
+- 否则 → 不推进 cursor（下次重试）

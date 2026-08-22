@@ -1,22 +1,34 @@
-# Step 100 Design: token 估算对齐 + unified_session + WeakValueDictionary
+# Step 102 Design: build_dream_prompt 模板化
 
-## 实现
+## 实现思路
 
-1. 导入 `weakref`
-2. `__init__` 新增 `unified_session: bool = False`，存储为 `self.unified_session`
-3. `_locks` 改为 `weakref.WeakValueDictionary()`，`get_lock` 改用 `setdefault`
-4. 新增 `estimate_session_prompt_tokens`：
-   - 获取未归档历史
-   - 解析 session.key 获取 channel/chat_id
-   - 获取 _last_summary
-   - 调用 `_build_messages` 构建 probe（try-except 适配不同签名）
-   - 调用 `estimate_prompt_tokens_chain` 返回 (tokens, source)
-5. `maybe_consolidate_by_tokens` 改用新方法，estimated <= 0 时回退
+修改 `MemoryStore.build_dream_prompt` 方法：
+
+**修改前：**
+```python
+prompt = (
+    "You are a memory curator. Review conversation summaries and "
+    "update the bot's memory files...\n\n"
+    f"{files_section}\n\n"
+    f"## Conversation History\n{history_text}"
+)
+```
+
+**修改后：**
+```python
+template = self._dream_template()
+prompt = (
+    f"{template}\n\n{files_section}\n\n"
+    f"## Conversation History\n{history_text}"
+)
+```
+
+核心变化：硬编码字符串替换为 `self._dream_template()` 调用，其余逻辑（历史读取、batch 截断、files_section 渲染、返回值）保持不变。
 
 ## 文件修改清单
 
 | 文件 | 操作 |
 |------|------|
-| `consolidation.py` | 修改：+weakref +unified_session +WeakValueDictionary +estimate_session_prompt_tokens +maybe_consolidate_by_tokens 改用 |
-| `tests/test_consolidator_tokens.py` | 新建 |
-| 规范文档 + step100.md | 新建 |
+| `memory.py` | 修改：build_dream_prompt 改用 _dream_template() |
+| `tests/test_build_dream_prompt.py` | 新建（6 测试） |
+| `proposal.md` / `design.md` / `api-spec.md` | 新建 |

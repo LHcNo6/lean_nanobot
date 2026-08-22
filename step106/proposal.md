@@ -1,25 +1,28 @@
-# Step 100 Proposal: token 估算对齐 + unified_session + WeakValueDictionary
+# Step 106 Proposal: MemoryStore Git 集成 + dream_content_diff
 
 ## 1. 问题背景
 
-Consolidator 当前用 `sum(estimate_message_tokens(m))` 逐个估算消息 token，未考虑系统提示、工具定义等开销，估算不准确。_locks 使用普通 dict 会无限增长。缺少 unified_session 参数。
+step105 已新增 GitStore 模块，但 MemoryStore 未集成。Dream 运行后的记忆文件变更无法获取差异摘要，commit message 和 cursor 推进门控缺少真实数据支撑。
 
 ## 2. 目标
 
-1. `__init__` 新增 `unified_session: bool = False` 参数
-2. `_locks` 改用 `weakref.WeakValueDictionary[str, asyncio.Lock]`
-3. 新增 `estimate_session_prompt_tokens(session, runtime)` 方法，通过 `_build_messages` 构建完整 probe 后调用 `estimate_prompt_tokens_chain`
-4. `maybe_consolidate_by_tokens` 改用 `estimate_session_prompt_tokens`，返回 `(estimated, source)` 元组
+1. MemoryStore `__init__` 中创建 GitStore 实例，跟踪 SOUL.md / USER.md / memory/MEMORY.md / memory/.dream_cursor
+2. 新增 `git` property 返回 GitStore 实例
+3. 新增 `dream_content_diff()` 方法，返回持久化记忆文件的未提交变更摘要
 
 ## 3. 非目标
 
-- 不修改 _build_messages 签名（后续 step）
-- 不修改 archive 方法（step99 已完成）
+- 不实现自动 commit（后续 harness 层集成）
+- 不修改 Dream 运行流程
+- 不修改 GitStore 实现（step105 已完成）
 
 ## 4. 验收标准
 
-1. unified_session 参数可传入并存储
-2. _locks 为 WeakValueDictionary 类型
-3. estimate_session_prompt_tokens 返回 (int, str) 元组
-4. maybe_consolidate_by_tokens 使用新方法估算
-5. 现有测试全部通过
+1. MemoryStore 初始化后 `_git` 为 GitStore 实例
+2. `git` property 返回该实例
+3. `dream_content_diff()` git 未初始化时返回空串
+4. `dream_content_diff()` 无变更时返回空串
+5. `dream_content_diff()` 有变更时返回结构化摘要（包含文件名和变更内容）
+6. 变更提交后 `dream_content_diff()` 返回空串
+7. tracked_files 包含 SOUL.md / USER.md / memory/MEMORY.md / memory/.dream_cursor
+8. 单元测试通过

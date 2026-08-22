@@ -1,18 +1,27 @@
-# Step 100 API 契约
+# Step 102 API 契约
 
-## consolidation.py 变更
+## memory.py — MemoryStore 变更
 
-### Consolidator.__init__
-新增参数 `unified_session: bool = False`。
+### build_dream_prompt（行为变更）
 
-### Consolidator._locks
-类型从 `dict[str, asyncio.Lock]` 改为 `weakref.WeakValueDictionary[str, asyncio.Lock]`。
-
-### Consolidator.estimate_session_prompt_tokens（新增）
 ```python
-def estimate_session_prompt_tokens(self, session, *, runtime) -> tuple[int, str]
+def build_dream_prompt(self, *, max_entries: int = 20) -> tuple[str, int] | None
 ```
-返回 (token_count, source)，source 为 "chain" 或 "fallback"。
 
-### maybe_consolidate_by_tokens（行为变更）
-改用 `estimate_session_prompt_tokens` 替代 `sum(estimate_message_tokens)`。
+**变更点：** prompt 前缀从硬编码字符串改为 `self._dream_template()`。
+
+**prompt 结构：**
+```
+{_dream_template()}
+
+## Current Memory Files
+{files_section}
+
+## Conversation History
+[timestamp] truncated_content
+...
+```
+
+**返回值：** `(prompt, last_cursor)` 或 `None`（无未处理历史时）。
+
+**无其他 API 变更。**

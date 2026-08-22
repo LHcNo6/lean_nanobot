@@ -1,25 +1,31 @@
-# Step 100 Proposal: token 估算对齐 + unified_session + WeakValueDictionary
+# Step 107 Proposal: build_dream_tools
 
 ## 1. 问题背景
 
-Consolidator 当前用 `sum(estimate_message_tokens(m))` 逐个估算消息 token，未考虑系统提示、工具定义等开销，估算不准确。_locks 使用普通 dict 会无限增长。缺少 unified_session 参数。
+Dream 运行时使用默认的完整工具集（包含 shell exec、网络请求等危险工具），存在安全风险。nanobot 的 Dream 运行使用受限工具集，只允许读取工作区文件和编辑记忆文件（SOUL.md / USER.md / memory/MEMORY.md）及 skills 目录。
 
 ## 2. 目标
 
-1. `__init__` 新增 `unified_session: bool = False` 参数
-2. `_locks` 改用 `weakref.WeakValueDictionary[str, asyncio.Lock]`
-3. 新增 `estimate_session_prompt_tokens(session, runtime)` 方法，通过 `_build_messages` 构建完整 probe 后调用 `estimate_prompt_tokens_chain`
-4. `maybe_consolidate_by_tokens` 改用 `estimate_session_prompt_tokens`，返回 `(estimated, source)` 元组
+新增 `build_dream_tools()` 方法，返回 Dream 运行专用的受限工具定义列表（OpenAI 格式），包含：
+- `read_file`：读取工作区文件
+- `write_file`：写入文件（限 skills 目录 + 记忆文件）
+- `edit_file`：替换文件内容（限 skills 目录 + 记忆文件）
+
+不包含 shell/exec/网络等危险工具。
 
 ## 3. 非目标
 
-- 不修改 _build_messages 签名（后续 step）
-- 不修改 archive 方法（step99 已完成）
+- 不实现实际的工具执行逻辑（复用现有 tools 模块）
+- 不修改 Dream 运行流程（main.run_dream 后续集成）
+- 不实现 ApplyPatchTool（当前工具集无此工具）
 
 ## 4. 验收标准
 
-1. unified_session 参数可传入并存储
-2. _locks 为 WeakValueDictionary 类型
-3. estimate_session_prompt_tokens 返回 (int, str) 元组
-4. maybe_consolidate_by_tokens 使用新方法估算
-5. 现有测试全部通过
+1. `build_dream_tools()` 返回非空列表
+2. 列表包含 read_file 工具定义
+3. 列表包含 write_file 工具定义
+4. 列表包含 edit_file 工具定义
+5. 不包含 shell / exec / 网络相关工具
+6. 每个工具定义有 name / description / parameters 字段
+7. 工具的 allowed_dir / extra_write_allowed_files 限制正确
+8. 单元测试通过

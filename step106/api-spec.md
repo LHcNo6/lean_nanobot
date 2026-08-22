@@ -1,18 +1,29 @@
-# Step 100 API 契约
+# Step 106 API 契约
 
-## consolidation.py 变更
+## memory.py — MemoryStore 变更
 
-### Consolidator.__init__
-新增参数 `unified_session: bool = False`。
-
-### Consolidator._locks
-类型从 `dict[str, asyncio.Lock]` 改为 `weakref.WeakValueDictionary[str, asyncio.Lock]`。
-
-### Consolidator.estimate_session_prompt_tokens（新增）
+### 新增类常量
 ```python
-def estimate_session_prompt_tokens(self, session, *, runtime) -> tuple[int, str]
+_DREAM_CONTENT_PATHS: tuple[str, ...] = ("SOUL.md", "USER.md", "memory/MEMORY.md")
 ```
-返回 (token_count, source)，source 为 "chain" 或 "fallback"。
 
-### maybe_consolidate_by_tokens（行为变更）
-改用 `estimate_session_prompt_tokens` 替代 `sum(estimate_message_tokens)`。
+### __init__ 变更
+新增实例字段 `_git: GitStore`，在初始化末尾创建：
+```python
+self._git = GitStore(workspace, tracked_files=[
+    "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
+])
+```
+
+### 新增属性
+```python
+@property
+def git(self) -> GitStore
+```
+返回 `self._git` 实例。
+
+### 新增方法
+```python
+def dream_content_diff(self) -> str
+```
+返回持久化记忆文件（SOUL.md / USER.md / memory/MEMORY.md）的未提交变更结构化摘要。git 未初始化或无变更时返回空串。

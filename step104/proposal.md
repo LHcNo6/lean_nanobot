@@ -1,25 +1,26 @@
-# Step 100 Proposal: token 估算对齐 + unified_session + WeakValueDictionary
+# Step 104 Proposal: dream_run_completed + build_dream_commit_message
 
 ## 1. 问题背景
 
-Consolidator 当前用 `sum(estimate_message_tokens(m))` 逐个估算消息 token，未考虑系统提示、工具定义等开销，估算不准确。_locks 使用普通 dict 会无限增长。缺少 unified_session 参数。
+Dream 运行后无法判断是否正常完成（可能因 max_iterations 耗尽或异常中断），且 commit message 由 LLM 自报告生成，不可靠。nanobot 通过 `metadata._stop_reason` 判断完成状态，commit message 基于真实 git diff 构建。
 
 ## 2. 目标
 
-1. `__init__` 新增 `unified_session: bool = False` 参数
-2. `_locks` 改用 `weakref.WeakValueDictionary[str, asyncio.Lock]`
-3. 新增 `estimate_session_prompt_tokens(session, runtime)` 方法，通过 `_build_messages` 构建完整 probe 后调用 `estimate_prompt_tokens_chain`
-4. `maybe_consolidate_by_tokens` 改用 `estimate_session_prompt_tokens`，返回 `(estimated, source)` 元组
+1. 新增 `dream_run_completed(resp)` 静态方法，通过 `resp.metadata["_stop_reason"] == "completed"` 判断 Dream run 是否正常完成
+2. 新增 `build_dream_commit_message(prefix, diff_body)` 静态方法，基于真实 diff 构建 commit message
+3. main.run_dream 中用 `dream_run_completed` 判断是否推进 dream cursor
 
 ## 3. 非目标
 
-- 不修改 _build_messages 签名（后续 step）
-- 不修改 archive 方法（step99 已完成）
+- 不实现自动 commit（step105-106 GitStore 完成后再集成）
+- 不修改 Dream prompt 或工具集
 
 ## 4. 验收标准
 
-1. unified_session 参数可传入并存储
-2. _locks 为 WeakValueDictionary 类型
-3. estimate_session_prompt_tokens 返回 (int, str) 元组
-4. maybe_consolidate_by_tokens 使用新方法估算
-5. 现有测试全部通过
+1. `dream_run_completed(None)` 返回 False
+2. `dream_run_completed` 无 metadata / metadata 非 dict / 无 _stop_reason / _stop_reason != "completed" 均返回 False
+3. `dream_run_completed` metadata._stop_reason == "completed" 返回 True
+4. `build_dream_commit_message` 空 diff 返回纯 prefix
+5. `build_dream_commit_message` 有 diff 返回 `prefix\n\ndiff_body`（strip 后）
+6. main.run_dream 未完成时不推进 cursor
+7. 单元测试通过
