@@ -145,14 +145,15 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 
 ### 6.2 最小增量 step 规划
 
-- **step120：子代理运行配置传播（G1–G4）**
-  - 最小范围：从 `config`（tools.max_tool_result_chars / agents.defaults.fail_on_tool_error 等）构造
-    `ContextGovernanceConfig` 传入子代理 `AgentRunSpec.governance_config`；并显式传
-    `fail_on_tool_error`、`finalize_on_max_iterations=False`、`max_iterations_message`、
-    `error_message`。
-  - 文件：`subagent.py`（`_run_subagent` 的 `AgentRunSpec`）、`config/schema.py`（确认字段来源）。
-  - 测试：子代理 spec 的 `governance_config.max_tool_result_chars` / `fail_on_tool_error` 等于父配置；
-    `finalize_on_max_iterations` 为 `False`。
+- **step120：子代理运行配置传播（G1–G4）** ✅ 已完成
+  - 实现：从 `config.agents.defaults` 提取 `max_tool_result_chars` / `fail_on_tool_error`
+    （缺省 16_000 / True），注入子代理 `AgentRunSpec`：`governance_config=ContextGovernanceConfig(
+    tools=tools, max_tool_result_chars=..., context_window_tokens=200_000, max_tokens=4096)`
+    （复刻 runner 默认预算，避免 `context_window_tokens=None` 触发全量工具结果摘要）、
+    `fail_on_tool_error`、对齐 nanobot 硬编码的 `finalize_on_max_iterations=False` 与
+    `max_iterations_message="Task completed but no final response was generated."`。
+  - 文件：`subagent.py`（`_run_subagent` 的 `AgentRunSpec` + 两个 `_extract_*` 辅助）。
+  - 测试：新增 `tests/test_subagent_run_config.py`（6 例）；全量失败数与 step119 基线持平（25）。
 
 - **step121：announce 模板化 + 通道清洗（G6 + G8）**
   - 最小范围：新增 `templates/agent/subagent_announce.md`，`_announce` 用其渲染；
