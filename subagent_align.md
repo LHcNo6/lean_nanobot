@@ -155,11 +155,15 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
   - 文件：`subagent.py`（`_run_subagent` 的 `AgentRunSpec` + 两个 `_extract_*` 辅助）。
   - 测试：新增 `tests/test_subagent_run_config.py`（6 例）；全量失败数与 step119 基线持平（25）。
 
-- **step121：announce 模板化 + 通道清洗（G6 + G8）**
-  - 最小范围：新增 `templates/agent/subagent_announce.md`，`_announce` 用其渲染；
-    引入 `subagent_channel_display` 对 announce body 做通道清洗；`_announce` / `_run_subagent` 透传 `origin_message_id`。
-  - 文件：`subagent.py`、`templates/agent/subagent_announce.md`、可选 `utils/subagent_channel_display.py`。
-  - 测试：announce 内容含模板占位渲染结果；`origin_message_id` 进入 `InboundMessage.metadata`。
+- **step121：announce 模板化 + origin_message_id 透传（G6 + G8）** ✅ 已完成
+  - 实现：新增 `templates/agent/subagent_announce.md` 与零依赖 `{{ var }}` 渲染器，
+    `_announce` 由内联 f-string 改为模板渲染（`status_text` 对齐 nanobot
+    `"completed successfully"`/`"failed"`）；`tools/spawn.py` 的 `origin` 补全
+    `origin_message_id`，`_announce` 非空时写入 `metadata["origin_message_id"]`。
+  - 通道清洗（G6 通道部分）**推迟独立 step**：nanobot 在展示边界清洗且保留 LLM 全文，
+    learn_nano 直接放 `_announce` 会截断 LLM 注入，故不在本 step 实现。
+  - 文件：`subagent.py`、`tools/spawn.py`、`templates/agent/subagent_announce.md`。
+  - 测试：新增 `tests/test_subagent_announce.py`（5 例）；全量失败数与 step120 基线持平（25）。
 
 - **step122：runtime/model 逐父同步（G5）**
   - 最小范围：`AgentRunSpec` 支持 `runtime` 注入（与 `provider` 并存，优先 `runtime`）；
