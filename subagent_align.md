@@ -181,11 +181,17 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
     清洗 announce 正文（保留 LLM 注入所需的全文结果），供 channel 层复用；`_announce` 本体不截断。
   - 说明：step121 已推迟此部分；因 learn_nano 无独立展示管线，须先建清洗工具再在合适边界接线。
 
-- **step123：子代理 ToolContext 沙箱 + 相位粒度（G9 + G10）**
-  - 最小范围：`_build_tools` 注入 `workspace_sandbox=workspace_sandbox_status(...)`；
-    `_run_subagent` 用 `checkpoint_callback` 更新 `status.phase` 多相位（initializing/awaiting_tools/...）。
-  - 文件：`subagent.py`。
-  - 测试：子代理 `ToolContext.workspace_sandbox` 已置；status.phase 在迭代中被更新为非终态。
+- **step123：子代理 ToolContext 沙箱 + 多相位状态（G9 + G10）** ✅ 已完成
+  - 实现（最小增量）：
+    - G9：`context.py` 的 `ToolContext` 新增 `workspace_sandbox: Any | None = None` 字段；
+      `subagent._build_tools` 构造 `ToolContext` 时注入
+      `workspace_sandbox=workspace_sandbox_status(restrict_to_workspace=self._restrict_to_workspace, workspace=root)`
+      （**仅子代理**，主循环 `loop.py` 不动，parity 留后续 step）。
+    - G10：`_run_subagent` 内定义 `_on_checkpoint(payload)` 闭包，把 runner 已发的
+      `awaiting_tools/tools_completed/final_response` 等相位同步到 `status.phase`，
+      并以 `checkpoint_callback` 传入 `AgentRunSpec`（runner 已原生支持，未改 runner）。
+  - 文件：`context.py`（字段）、`subagent.py`（注入 + 接线）。
+  - 测试：新增 `tests/test_subagent_sandbox_phase.py`（3 例）；全量失败数与 step122 基线持平（25）。
 
 - **step124：spawn temperature 覆写（G7）**
   - 最小范围：`spawn` 增加 `temperature` 参数，`runtime.with_generation_overrides(temperature=...)` 后下发。
@@ -197,7 +203,8 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 1. **step120（必做）**：唯一影响运行行为正确性的缺口，优先一个 step 补齐。 ✅
 2. **step121**：announce 模板 + origin_message_id 透传（通道清洗推迟独立 step）。 ✅
 3. **step122**：runtime 逐父同步（G5，衍生标量方案，无 runner 改动）。 ✅
-4. **step「通道清洗」**：G6 通道部分独立 step。
-5. **step123 / step124**：打磨项，按需。
+4. **step123**：子代理 ToolContext 沙箱 + 多相位状态（G9+G10，仅子代理注入）。 ✅
+5. **step「通道清洗」**：G6 通道部分独立 step。
+6. **step124**：spawn temperature 覆写（G7）。
 
 > 注：以上 step120–124 实施时均先写 proposal/design/api-spec 三份规范再落地。
