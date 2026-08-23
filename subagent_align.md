@@ -165,12 +165,21 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
   - 文件：`subagent.py`、`tools/spawn.py`、`templates/agent/subagent_announce.md`。
   - 测试：新增 `tests/test_subagent_announce.py`（5 例）；全量失败数与 step120 基线持平（25）。
 
-- **step122：runtime/model 逐父同步（G5）**
-  - 最小范围：`AgentRunSpec` 支持 `runtime` 注入（与 `provider` 并存，优先 `runtime`）；
-    `spawn`/`_run_subagent` 透传 `origin["runtime"]` 到 `AgentRunSpec.runtime`，替换共享 provider。
-  - 风险：结构性改动（provider→runtime 重构），需评估 runner 兼容。
-  - 文件：`subagent.py`、`runner.py`（如需 `runtime` 字段）。
-  - 测试：子代理 spec 携带父 `runtime`；model 与父一致。
+- **step122：runtime/model 逐父同步（G5）** ✅ 已完成
+  - 实现（最小增量·衍生标量）：`_run_subagent` 从 `origin["runtime"]` 衍生
+    `model`/`temperature`/`max_tokens` 注入 `AgentRunSpec`（`provider` 沿用 `self._provider`，
+    生产环境 `self._provider == runtime.provider` 同对象，终态等价 nanobot）。
+    **未新增 `AgentRunSpec.runtime` 字段、未改 `runner.py`**（经调研，runner 已把
+    `spec.model/temperature/max_tokens` 转发给 `provider.chat_with_retry`，故改写标量即生效，
+    且 `main.py` 接线使 provider 同对象，规避回归）。
+  - 文件：`subagent.py`（`_run_subagent` 入口衍生 + `AgentRunSpec` 注入）。
+  - 测试：新增 `tests/test_subagent_runtime_sync.py`（3 例）；全量失败数与 step121 基线持平（25）。
+  - 刻意遗留：`context_window_tokens` 仍用 step120 的 `200_000`（防回归）；`provider` 取 `self._provider`。
+
+- **step「通道清洗」（G6 通道部分，独立 step）**
+  - 范围：实现 `utils/subagent_channel_display.py` 的 `scrub_subagent_announce_body`，在**展示边界**
+    清洗 announce 正文（保留 LLM 注入所需的全文结果），供 channel 层复用；`_announce` 本体不截断。
+  - 说明：step121 已推迟此部分；因 learn_nano 无独立展示管线，须先建清洗工具再在合适边界接线。
 
 - **step123：子代理 ToolContext 沙箱 + 相位粒度（G9 + G10）**
   - 最小范围：`_build_tools` 注入 `workspace_sandbox=workspace_sandbox_status(...)`；
@@ -185,9 +194,10 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 
 ### 6.3 推进顺序建议
 
-1. **step120（必做）**：唯一影响运行行为正确性的缺口，优先一个 step 补齐。
-2. **step121**：announce 模板 + 通道清洗，提升父代理可读性。
-3. **step122**：runtime 同步（较大，可评估是否必要）。
-4. **step123 / step124**：打磨项，按需。
+1. **step120（必做）**：唯一影响运行行为正确性的缺口，优先一个 step 补齐。 ✅
+2. **step121**：announce 模板 + origin_message_id 透传（通道清洗推迟独立 step）。 ✅
+3. **step122**：runtime 逐父同步（G5，衍生标量方案，无 runner 改动）。 ✅
+4. **step「通道清洗」**：G6 通道部分独立 step。
+5. **step123 / step124**：打磨项，按需。
 
-> 注：以上 step120–124 为规划，未实现；实施时仍先写 proposal/design/api-spec 三份规范再落地。
+> 注：以上 step120–124 实施时均先写 proposal/design/api-spec 三份规范再落地。
