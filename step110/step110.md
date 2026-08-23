@@ -50,8 +50,8 @@ memory.py 文件开头存在 UTF-8 BOM（EF BB BF）。Python 3 虽可容忍 BOM
 | step104 | dream 运行判断 | dream_run_completed + build_dream_commit_message |
 | step105 | GitStore 模块 | 新增 utils/gitstore.py（init/auto_commit/summarize_working_tree） |
 | step106 | Git 集成 | MemoryStore.__init__ 集成 GitStore + git property + dream_content_diff |
-| step107 | dream 工具集 | build_dream_tools 受限工具集（Read/Edit/ApplyPatch/Write） |
-| step108 | Legacy 迁移 | HISTORY.md → history.jsonl 自动迁移（7 个方法 + 3 个正则） |
+| step107 | dream 工具集 | build_dream_tools 受限工具集（read_file/write_file/edit_file，OpenAI function 格式列表） |
+| step108 | Legacy 迁移 | HISTORY.md → history.jsonl 迁移（migrate_legacy_history 显式调用，7 个方法 + 3 个正则） |
 | step109 | 格式统一 | _format_messages 单行格式对齐 + raw_archive 消息计数与日志 |
 | step110 | 回归与文档 | 全量测试 + BOM 修复 + 文档收尾 |
 
@@ -133,16 +133,27 @@ memory.py 文件开头存在 UTF-8 BOM（EF BB BF）。Python 3 虽可容忍 BOM
 ### 全量测试
 
 ```
-1037 passed, 30 failed
+1082 passed, 25 failed
 ```
 
-30 个失败均为 step91 基线已存在的平台/环境问题：
-- bwrap 沙箱测试（Linux 专属，Windows 不支持）
-- Unix 路径格式测试
-- openai 模块依赖缺失
-- 其余为 runner/events/config 等非 memory 模块的预先存在问题
+25 个失败均为非 memory 模块的预先存在平台/环境问题（方向与 step91 基线一致）：
 
-**确认：memory 改动未引入任何新增回归。**
+| 模块 | 数量 | 说明 |
+|------|------|------|
+| runner_robustness（重试分类/模式） | 8 | 预先存在 |
+| workspace_tool（read_file context/boundary） | 5 | 预先存在 |
+| runner_finalization | 3 | 预先存在 |
+| events（心跳/事件路由） | 3 | 预先存在 |
+| exec_session / exec_enhanced（Unix 路径等） | 3 | 预先存在 |
+| runtime_context | 2 | 预先存在 |
+| sandbox（bwrap，Linux 专属） | 1 | Windows 必然失败 |
+
+**确认：memory 域 19 个测试文件全部通过，未引入任何新增回归。**
+
+> 注：默认配置下全量运行在格式化失败详情时会触发 pytest INTERNALERROR
+> （AST recursion depth mismatch，pytest 9.1.1 + Python 3.11 环境问题），
+> 需加 `--tb=no` 方可完整跑完。本数字为本机实测；文档初稿记录的
+> `1037 passed, 30 failed` 与当前环境存在约 40 用例的环境差异。
 
 ## 七、对齐度总结
 
@@ -161,7 +172,7 @@ memory.py 文件开头存在 UTF-8 BOM（EF BB BF）。Python 3 虽可容忍 BOM
 
 ## 八、暴露的问题
 
-1. **全量测试环境依赖**：test_config.py 依赖 openai 模块，当前环境未安装，导致收集阶段中断。建议后续 step 添加 mock 或条件跳过。
+1. **全量测试环境依赖**：文档初稿环境中 test_config.py 因缺 openai 模块在收集阶段中断；本次验证环境已安装 openai，test_config 正常通过。建议后续 step 为该依赖添加 mock 或条件跳过以保证可复现性。
 2. **平台相关测试**：bwrap、Unix 路径等测试在 Windows 上必然失败，建议添加平台 skip 标记。
 3. **规范文档复制错误**：step109-step110 的 proposal/design/api-spec 初始内容均为 step100 的复制，说明批量创建 step 时需要更严格的文档校验。
 

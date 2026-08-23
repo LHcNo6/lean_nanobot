@@ -26,7 +26,7 @@ step110 是 memory 对齐主题的收尾 step，不新增功能，专注于验�
 | Consolidator token | test_consolidator_tokens.py | unified_session / WeakValueDictionary / estimate_session_prompt_tokens |
 | Consolidator 回放 | test_consolidation_replay.py | _replay_overflow_boundary / _consolidate_replay_overflow / maybe_consolidate_by_tokens |
 | 格式对齐 | test_format_raw_archive.py | _format_messages 格式 / raw_archive 消息计数与日志 |
-| Legacy 迁移 | test_legacy_migration.py | HISTORY.md → history.jsonl 自动迁移 |
+| Legacy 迁移 | test_legacy_migration.py | HISTORY.md → history.jsonl 迁移（migrate_legacy_history 显式调用，非自动触发） |
 | GitStore | test_gitstore.py | GitStore 初始化 / auto_commit / summarize_working_tree |
 | Token 截断 | test_truncate_tokens.py | truncate_text_to_tokens 函数 |
 
@@ -36,7 +36,7 @@ memory.py 文件开头存在 UTF-8 BOM（EF BB BF），Python 虽可容忍但不
 
 ### 3. 回归基线对比
 
-将 step110 全量测试结果与 step91（memory 改动前基线）对比，确认 30 个失败测试均为预先存在的平台/环境问题（bwrap 沙箱、Unix 路径、openai 依赖等），无 memory 改动引入的新增回归。
+将 step110 全量测试结果与 step91（memory 改动前基线）对比，确认 25 个失败测试均为预先存在的平台/环境问题（bwrap 沙箱、Unix 路径、runner 重试等），无 memory 改动引入的新增回归。
 
 ## 文件修改清单
 

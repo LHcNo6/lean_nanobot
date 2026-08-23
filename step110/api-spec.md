@@ -18,7 +18,7 @@ step110 无 API 变更。本文档记录 memory 主题对齐完成后（step92-s
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `__init__` | `(workspace, max_history_entries=1000)` | 初始化，含 GitStore 集成和 legacy 自动迁移 |
+| `__init__` | `(workspace, max_history_entries=1000)` | 初始化，集成 GitStore；legacy 迁移不在此触发，需显式调用 `migrate_legacy_history()` |
 | `append_history` | `(entry, *, max_chars=None, session_key=None) -> int` | 追加历史，集成 strip_think，返回 cursor |
 | `read_unprocessed_history` | `(since_cursor: int) -> list[dict]` | 返回 cursor > since_cursor 的有效条目 |
 | `read_recent_history_for_prompt` | `(since_cursor, *, session_key, unified_session=False) -> list[dict]` | 按会话过滤的近期历史，用于 prompt 注入 |
@@ -32,8 +32,10 @@ step110 无 API 变更。本文档记录 memory 主题对齐完成后（step92-s
 | `get_latest_cursor` | `() -> int` | 返回最新 cursor（max(_next_cursor()-1, 0)） |
 | `build_dream_prompt` | `(*, max_entries=20) -> tuple[str, int] \| None` | 构建 Dream prompt（模板化） |
 | `dream_content_diff` | `() -> str` | Git 工作树差异摘要 |
-| `build_dream_tools` | `() -> ToolRegistry` | Dream 受限工具集 |
+| `build_dream_tools` | `() -> list[dict[str, Any]]` | Dream 受限工具集（OpenAI function 格式定义：read_file / write_file / edit_file，无 shell/网络工具） |
+| `migrate_legacy_history` | `() -> int` | 将旧版 HISTORY.md 解析迁移到 history.jsonl 并备份原文件，返回迁移条目数；无文件或失败返回 0。**非自动触发**，需调用方显式调用 |
 | `has_dream_prompt_override` | `() -> bool` | 检测 workspace dream prompt 覆盖 |
+| `default_dream_prompt` | `() -> str` | 静态方法，返回默认 Dream prompt 模板 |
 | `dream_run_completed` | `(resp) -> bool` | 静态方法，判断 Dream run 是否正常完成 |
 | `dream_session_key` | `() -> str` | 静态方法，生成 `dream:timestamp` 会话键 |
 | `build_dream_commit_message` | `(prefix, diff_body) -> str` | 静态方法，基于 diff 构建 commit message |
@@ -66,9 +68,9 @@ step110 无 API 变更。本文档记录 memory 主题对齐完成后（step92-s
 | 方法 | 说明 |
 |------|------|
 | `is_initialized() -> bool` | Git 仓库是否初始化 |
-| `init() -> None` | 初始化 git 仓库 |
-| `summarize_working_tree(paths) -> str` | 工作树差异结构化摘要 |
-| `auto_commit(message) -> str \| None` | 自动提交，返回 commit SHA |
+| `init() -> bool` | 初始化 git 仓库（写 .gitignore、初始提交）；新建返回 True，已存在返回 False |
+| `summarize_working_tree() -> str` | tracked 文件工作树变更摘要（`git status --porcelain`，无参数） |
+| `auto_commit(message) -> str \| None` | 暂存 tracked 文件并提交，返回短 SHA；无变更返回 None |
 
 ## utils/workspace_prompts.py
 
