@@ -137,7 +137,7 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 | A | G3 | `finalize_on_max_iterations` 语义差异 | 默认 `True`（生成收尾 fallback） | 子代理用 `False`（隐形续跑接管） |
 | A | G4 | `max_iterations_message`/`error_message` 未显式传 | 用默认文案 | 显式传 |
 | B runtime 同步 | G5 | 子代理用共享 `provider`，未传 per-parent `runtime`（模型/生成参数） | 共享 `self._provider` | 传 `runtime=runtime` |
-| C announce 保真 | G6 | 未渲染 `subagent_announce.md` 模板；缺 `subagent_channel_display` body 清洗 | 内联 f-string | 模板渲染 + 通道清洗 |
+| C announce 保真 | G6 | 未渲染 `subagent_announce.md` 模板；缺 `subagent_channel_display` body 清洗 | 内联 f-string | 模板渲染（✅ step121） + 通道清洗（✅ step125） |
 | C | G8 | announce 未透传 `origin_message_id` | `_announce` 无该参数 | 透传以精准路由 |
 | D API/上下文增强 | G7 | `spawn` 不支持 `temperature` 覆写 | 不支持 | `runtime.with_generation_overrides` | ✅ step124 |
 | D | G9 | 子代理 `ToolContext` 未注入 `workspace_sandbox` | 未注入 | 注入 `workspace_sandbox_status(...)` |
@@ -176,10 +176,16 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
   - 测试：新增 `tests/test_subagent_runtime_sync.py`（3 例）；全量失败数与 step121 基线持平（25）。
   - 刻意遗留：`context_window_tokens` 仍用 step120 的 `200_000`（防回归）；`provider` 取 `self._provider`。
 
-- **step「通道清洗」（G6 通道部分，独立 step）**
-  - 范围：实现 `utils/subagent_channel_display.py` 的 `scrub_subagent_announce_body`，在**展示边界**
-    清洗 announce 正文（保留 LLM 注入所需的全文结果），供 channel 层复用；`_announce` 本体不截断。
-  - 说明：step121 已推迟此部分；因 learn_nano 无独立展示管线，须先建清洗工具再在合适边界接线。
+- **step125：通道清洗（G6 通道部分）** ✅ 已完成
+  - 实现（最小增量）：
+    - `utils/subagent_channel_display.py`（新增）：`scrub_subagent_announce_body`（保留
+      `[Subagent` 头 + 截断 `Result:` 正文，移除 `Task:`/`Summarize` 脚手架，上限 800 字符）
+      + `scrub_subagent_messages_for_channel`（原地改写 `subagent_result` 消息）。
+    - `command/builtin.py._cmd_history`：`/history` 展示边界对 `injected_event ==
+      "subagent_result"` 的行先清洗再展示；持久化全文与 LLM 上下文不变。
+  - 文件：`utils/subagent_channel_display.py`、`command/builtin.py`。
+  - 测试：新增 `tests/test_subagent_channel_display.py`（6 例）；全量失败数与 step124 基线持平（25）。
+  - 说明：step121 推迟此部分；learn_nano 无独立展示管线，故清洗工具 + `/history` 边界接线即对齐 nanobot。
 
 - **step123：子代理 ToolContext 沙箱 + 多相位状态（G9 + G10）** ✅ 已完成
   - 实现（最小增量）：
@@ -213,6 +219,7 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 3. **step122**：runtime 逐父同步（G5，衍生标量方案，无 runner 改动）。 ✅
 4. **step123**：子代理 ToolContext 沙箱 + 多相位状态（G9+G10，仅子代理注入）。 ✅
 5. **step124**：spawn temperature 覆写（G7）。 ✅
-6. **step「通道清洗」**：G6 通道部分独立 step（唯一剩余路线图项）。
+6. **step125**：通道清洗（G6 通道部分）独立 step。 ✅
 
-> 注：以上 step120–124 实施时均先写 proposal/design/api-spec 三份规范再落地。
+> 注：以上 step120–125 实施时均先写 proposal/design/api-spec 三份规范再落地。
+> 路线图 §6（step120–125）规划项**全部完成**，子代理子系统已高度对齐 nanobot（G1–G10 覆盖）。
