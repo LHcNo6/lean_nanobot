@@ -139,7 +139,7 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 | B runtime 同步 | G5 | 子代理用共享 `provider`，未传 per-parent `runtime`（模型/生成参数） | 共享 `self._provider` | 传 `runtime=runtime` |
 | C announce 保真 | G6 | 未渲染 `subagent_announce.md` 模板；缺 `subagent_channel_display` body 清洗 | 内联 f-string | 模板渲染 + 通道清洗 |
 | C | G8 | announce 未透传 `origin_message_id` | `_announce` 无该参数 | 透传以精准路由 |
-| D API/上下文增强 | G7 | `spawn` 不支持 `temperature` 覆写 | 不支持 | `runtime.with_generation_overrides` |
+| D API/上下文增强 | G7 | `spawn` 不支持 `temperature` 覆写 | 不支持 | `runtime.with_generation_overrides` | ✅ step124 |
 | D | G9 | 子代理 `ToolContext` 未注入 `workspace_sandbox` | 未注入 | 注入 `workspace_sandbox_status(...)` |
 | D | G10 | `SubagentStatus` 相位粒度不足 | 仅 `done`/`error` | `checkpoint_callback` 更新多相位 |
 
@@ -193,10 +193,18 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
   - 文件：`context.py`（字段）、`subagent.py`（注入 + 接线）。
   - 测试：新增 `tests/test_subagent_sandbox_phase.py`（3 例）；全量失败数与 step122 基线持平（25）。
 
-- **step124：spawn temperature 覆写（G7）**
-  - 最小范围：`spawn` 增加 `temperature` 参数，`runtime.with_generation_overrides(temperature=...)` 后下发。
-  - 文件：`subagent.py`、`tools/spawn.py`。
-  - 测试：传入 `temperature` 后子代理运行 runtime 的 `temperature` 被覆写。
+- **step124：spawn temperature 覆写（G7）** ✅ 已完成
+  - 实现（最小增量）：
+    - `llm.py`：`LLMRuntime` 新增 `with_generation_overrides(temperature=None, max_tokens=None)`
+      （不可变覆写，返回新实例，对齐 nanobot）。
+    - `subagent.py`：`spawn` 增加 `temperature` 形参，非空时 `origin["runtime"] =
+      origin["runtime"].with_generation_overrides(temperature=temperature)`（runtime 为 None 时以
+      `self._provider` 合成最小 runtime 兜底）；覆写经 step122（G5）既有通道自动生效，
+      **不改 `_run_subagent` / runner**。
+    - `tools/spawn.py`：schema 增加 `temperature=NumberSchema(0.7, minimum=0.0, maximum=2.0)`，
+      `execute` 接纳并透传。
+  - 文件：`llm.py`、`subagent.py`、`tools/spawn.py`。
+  - 测试：新增 `tests/test_subagent_temperature_override.py`（5 例）；全量失败数与 step123 基线持平（25）。
 
 ### 6.3 推进顺序建议
 
@@ -204,7 +212,7 @@ step110–119 核心九维度已全部对齐，且 `cancel_by_session` 与 mid-t
 2. **step121**：announce 模板 + origin_message_id 透传（通道清洗推迟独立 step）。 ✅
 3. **step122**：runtime 逐父同步（G5，衍生标量方案，无 runner 改动）。 ✅
 4. **step123**：子代理 ToolContext 沙箱 + 多相位状态（G9+G10，仅子代理注入）。 ✅
-5. **step「通道清洗」**：G6 通道部分独立 step。
-6. **step124**：spawn temperature 覆写（G7）。
+5. **step124**：spawn temperature 覆写（G7）。 ✅
+6. **step「通道清洗」**：G6 通道部分独立 step（唯一剩余路线图项）。
 
 > 注：以上 step120–124 实施时均先写 proposal/design/api-spec 三份规范再落地。
